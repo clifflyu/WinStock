@@ -1,0 +1,36 @@
+# ---- 本地数据 ----
+# data/ 是默认库目录，全量约 174 MB；*.db 兜住 --db 指定的其他路径。
+# 这两个库都可以用 `python -m winstocker init` 重新生成，不入库。
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# ---- 运行日志 ----
+# 例：python -m winstocker init 2>&1 | tee init.log
+*.log
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# ---- 虚拟环境 ----
+.venv/
+venv/
+env/
+
+# ---- 测试与静态检查缓存 ----
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ---- 编辑器与操作系统 ----
+.DS_Store
+.idea/
+.vscode/
+*.swp
