@@ -1,6 +1,7 @@
 # systemd 部署
 
-每天北京时间 19:30 自动执行数据更新、审计、候选池生成，并推送一张飞书卡片。
+交易日北京时间 09:46 执行前夜计划的模拟成交并推送；每天 19:30 执行数据更新、
+审计、候选池生成、收盘估值、次日计划并推送。09:46 是为了等待 09:45 的首根15分钟K完整形成。
 
 **首次部署请照 [`飞书推送部署指南.md`](飞书推送部署指南.md) 操作**（含飞书机器人创建、
 数据库准备、故障排查）。本文只说明脚本本身。
@@ -23,14 +24,15 @@ Webhook，并检查它确实被 `.gitignore` 忽略（本仓库公开，提交�
 ```bash
 sudo systemctl start winstock-update.service
 sudo systemctl status winstock-update.service
-sudo systemctl list-timers winstock-update.timer --all
+sudo systemctl list-timers winstock-update.timer winstock-morning.timer --all
 sudo journalctl -u winstock-update.service -n 100 --no-pager
+sudo journalctl -u winstock-morning.service -n 100 --no-pager
 ```
 
 停用：
 
 ```bash
-sudo systemctl disable --now winstock-update.timer
+sudo systemctl disable --now winstock-update.timer winstock-morning.timer
 ```
 
 脚本默认自动识别项目目录、Python 和 `data/winstock.db`。服务用户须能读取项目并写入数据库目录。

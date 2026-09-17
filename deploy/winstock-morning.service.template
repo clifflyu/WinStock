@@ -1,0 +1,13 @@
+[Unit]
+Description=WinStock 09:45 paper execution and Feishu notification
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=__WINSTOCK_USER__
+WorkingDirectory=__WINSTOCK_DIR__
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=__WINSTOCK_PYTHON__ -m winstocker --db __WINSTOCK_DB__ paper-morning
+Nice=10
+UMask=0077

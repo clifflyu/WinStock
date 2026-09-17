@@ -20,6 +20,7 @@ from .candidates import Candidate
 from .backtest import RotationResult
 from .paper import PaperRebalance
 from .intraday import IntradayExperiment
+from .paper_flow import PaperPlan
 
 LOG = logging.getLogger("winstocker")
 
@@ -77,6 +78,7 @@ class DailyDigest:
     paper_updates: tuple[PaperRebalance, ...] = ()
     paper_error: str | None = None
     intraday_experiment: IntradayExperiment | None = None
+    paper_plans: tuple[PaperPlan, ...] = ()
 
     @property
     def status(self) -> str:
@@ -248,7 +250,7 @@ def _backtest_block(digest: DailyDigest) -> str:
 def _paper_block(digest: DailyDigest) -> str:
     if digest.paper_error:
         return f"**自动模拟交易：异常**\n{digest.paper_error}"
-    if not digest.paper_updates:
+    if not digest.paper_updates and not digest.paper_plans:
         return "**自动模拟交易：未执行**\n没有启用的模拟策略账户，或本次为只读预览。"
     sections: list[str] = []
     for update in digest.paper_updates:
@@ -269,7 +271,37 @@ def _paper_block(digest: DailyDigest) -> str:
         if not update.fills:
             lines.append("- 今日无成交")
         sections.append("\n".join(lines))
+    for plan in digest.paper_plans:
+        state = "待执行" if plan.pending else "无需调仓"
+        sections.append(f"**次日计划 · {plan.account} · {state}**\n{plan.note}")
     return "\n\n".join(sections)
+
+
+def build_morning_card(generated_at: datetime, updates: tuple[PaperRebalance, ...],
+                       error: str | None = None) -> dict[str, Any]:
+    if error:
+        content = f"🚨 **09:45模拟执行异常**\n{error}"
+        template = "red"
+    elif not updates:
+        content = "**09:45模拟执行：无成交**\n没有到期计划、今日休市，或09:45分钟K尚未形成。"
+        template = "blue"
+    else:
+        chunks = []
+        for update in updates:
+            lines = [f"**{update.account}** · {update.note}"]
+            for fill in update.fills:
+                side = "买入" if fill.side == "BUY" else "卖出"
+                lines.append(f"- {side} **{fill.symbol}** {fill.shares}股 @ {fill.price:.3f} · 费税 {fill.fee + fill.tax:.2f}")
+            if not update.fills:
+                lines.append("- 无成交")
+            lines.append(f"现金 {update.status.cash:,.2f} · 持仓 {update.status.positions}只")
+            chunks.append("\n".join(lines))
+        content = "\n\n".join(chunks)
+        template = "green"
+    content += f"\n\n生成于 {generated_at:%Y-%m-%d %H:%M:%S} · 仅为模拟交易，不连接券商。"
+    return {"config": {"wide_screen_mode": True},
+            "header": {"title": {"tag": "plain_text", "content": "WinStock 09:45模拟执行"}, "template": template},
+            "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": content}}]}
 
 
 def _intraday_block(digest: DailyDigest) -> str:

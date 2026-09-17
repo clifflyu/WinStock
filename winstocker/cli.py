@@ -23,9 +23,10 @@ from .evaluation import compare_buy_and_hold
 from .gate import evaluate_gate
 from .intraday import run_execution_experiment
 from .notify import (ERROR_MAX_CHARS, SECRET_ENV, WEBHOOK_ENV, DailyDigest, NotifyTarget, PreviousPoolBacktest,
-                     build_card, build_test_card, credential, require_credential, send_card)
-from .paper import (account_status, create_account, enable_auto_strategy, mark_account,
-                    rebalance_account, run_enabled_strategies)
+                     build_card, build_morning_card, build_test_card, credential, require_credential, send_card)
+from .paper import (PaperRebalance, account_status, create_account, enable_auto_strategy, mark_account,
+                    rebalance_account)
+from .paper_flow import close_enabled_accounts, create_evening_plans, execute_pending_plans
 from .reporting import write_backtest_report, write_comparison_report, write_walk_forward_report
 from .robustness import walk_forward_robustness
 from .snapshots import DEFAULT_STRATEGY_KEY, previous_snapshot, save_snapshot, snapshot_status
@@ -715,6 +716,26 @@ def run_minute_experiment(args: argparse.Namespace) -> None:
         conn.close()
 
 
+def run_paper_morning(args: argparse.Namespace) -> None:
+    now = datetime.now(BEIJING)
+    updates: tuple[PaperRebalance, ...] = ()
+    error: str | None = None
+    if args.dry_run:
+        push_card(args, build_morning_card(now, (), None))
+        return
+    conn = connect(args.db)
+    try:
+        updates = execute_pending_plans(conn, now.date().isoformat())
+    except Exception as caught:
+        error = str(caught)[:ERROR_MAX_CHARS]
+        LOG.error("09:45模拟执行失败：%s", error)
+    finally:
+        conn.close()
+    push_card(args, build_morning_card(now, updates, error))
+    if error:
+        raise SystemExit(1)
+
+
 def run_check(args: argparse.Namespace) -> None:
     symbols = tuple(item.strip() for item in args.symbols.split(",") if item.strip())
     conn = connect(args.db)
@@ -903,13 +924,15 @@ def run_daily(args: argparse.Namespace) -> None:
                 LOG.warning("上一日候选池回测暂不可用：%s", backtest_error)
             if not args.dry_run:
                 try:
-                    paper_updates = run_enabled_strategies(conn, digest.data_date)
-                    digest = replace(digest, paper_updates=paper_updates)
-                    for paper_result in paper_updates:
-                        LOG.info("自动模拟账户 %s：%s；权益 %.2f，现金 %.2f，持仓 %d",
-                                 paper_result.account, paper_result.note,
-                                 paper_result.status.total_value, paper_result.status.cash,
-                                 paper_result.status.positions)
+                    statuses = close_enabled_accounts(conn, digest.data_date)
+                    paper_updates = tuple(PaperRebalance(
+                        status.account, digest.data_date, None, False, 0, 0, 0,
+                        "收盘估值已更新", status) for status in statuses)
+                    plans = create_evening_plans(conn, digest.data_date)
+                    digest = replace(digest, paper_updates=paper_updates, paper_plans=plans)
+                    for status in statuses:
+                        LOG.info("模拟账户 %s 收盘：权益 %.2f，现金 %.2f，持仓 %d",
+                                 status.account, status.total_value, status.cash, status.positions)
                 except Exception as error:
                     # 模拟账户是附加研究功能，失败不能让数据健康与候选池播报一起降级。
                     paper_error = str(error)[:ERROR_MAX_CHARS]
@@ -1069,6 +1092,10 @@ def parser() -> argparse.ArgumentParser:
     minute_experiment = sub.add_parser("minute-experiment", help="运行开盘价与09:45成交过滤的影子A/B实验")
     minute_experiment.add_argument("--as-of", help="观察交易日，默认最近完整覆盖日")
     minute_experiment.add_argument("--top-n", type=int, default=3)
+    paper_morning = sub.add_parser("paper-morning", help="09:45按前夜计划执行模拟成交并推送飞书")
+    paper_morning.add_argument("--webhook", help=f"飞书机器人 Webhook，默认读 {WEBHOOK_ENV}")
+    paper_morning.add_argument("--secret", help=f"飞书签名密钥，默认读 {SECRET_ENV}")
+    paper_morning.add_argument("--dry-run", action="store_true")
     check = sub.add_parser("check", help="自动检查策略是否仅可进入模拟观察；绝不输出实盘许可")
     check.add_argument("--symbols", required=True, help="逗号分隔的股票池")
     check.add_argument("--benchmark", default="000300")
@@ -1132,7 +1159,7 @@ def main() -> None:
         if args.command in ("update", "daily"):
             if date.fromisoformat(args.bootstrap_start) > date.fromisoformat(args.end):
                 raise ValueError("--bootstrap-start 不能晚于 --end")
-        {"init": run_init, "update": run_update, "list": run_list, "status": run_status, "audit": run_audit, "backtest": run_backtest, "rotation": run_rotation, "validate": run_validate, "compare": run_compare, "candidates": run_candidates, "snapshot-status": run_snapshot_status, "paper-init": run_paper_init, "paper-status": run_paper_status, "paper-mark": run_paper_mark, "paper-auto-init": run_paper_auto_init, "paper-rebalance": run_paper_rebalance, "minute-experiment": run_minute_experiment, "check": run_check, "daily": run_daily, "notify": run_notify}[args.command](args)
+        {"init": run_init, "update": run_update, "list": run_list, "status": run_status, "audit": run_audit, "backtest": run_backtest, "rotation": run_rotation, "validate": run_validate, "compare": run_compare, "candidates": run_candidates, "snapshot-status": run_snapshot_status, "paper-init": run_paper_init, "paper-status": run_paper_status, "paper-mark": run_paper_mark, "paper-auto-init": run_paper_auto_init, "paper-rebalance": run_paper_rebalance, "paper-morning": run_paper_morning, "minute-experiment": run_minute_experiment, "check": run_check, "daily": run_daily, "notify": run_notify}[args.command](args)
     except Exception as error:
         LOG.error("%s", error)
         raise SystemExit(1) from error

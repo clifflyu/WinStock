@@ -70,6 +70,11 @@ python3 -m winstocker paper-status --name momentum-10k
 python3 -m winstocker minute-experiment
 ```
 
+自动模拟采用三阶段流程：晚间 `daily` 按当日快照生成下一交易日计划并推送；交易日
+09:46（等待09:45的15分钟K完整形成）执行 `paper-morning`，按过滤规则模拟成交并单独
+推送；晚间 `daily` 再按收盘价更新净值和总结。部署脚本会同时安装早盘和晚间两个
+systemd timer。重复执行不会重复成交，休市或分钟K缺失时不会虚构成交。
+
 Webhook 地址是凭据，配置写在**项目根目录的 `.env`**（已在 `.gitignore` 中，本仓库
 是公开的）。仓库里附带模板 `.env.example`：
 

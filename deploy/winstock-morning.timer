@@ -1,0 +1,10 @@
+[Unit]
+Description=Run WinStock paper execution after the first 15-minute bar
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 09:46:00 Asia/Shanghai
+Persistent=false
+Unit=winstock-morning.service
+
+[Install]
+WantedBy=timers.target
