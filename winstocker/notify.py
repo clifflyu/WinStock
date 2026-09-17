@@ -19,6 +19,7 @@ from .audit import DataAudit
 from .candidates import Candidate
 from .backtest import RotationResult
 from .paper import PaperRebalance
+from .intraday import IntradayExperiment
 
 LOG = logging.getLogger("winstocker")
 
@@ -75,6 +76,7 @@ class DailyDigest:
     backtest_error: str | None = None
     paper_updates: tuple[PaperRebalance, ...] = ()
     paper_error: str | None = None
+    intraday_experiment: IntradayExperiment | None = None
 
     @property
     def status(self) -> str:
@@ -270,6 +272,25 @@ def _paper_block(digest: DailyDigest) -> str:
     return "\n\n".join(sections)
 
 
+def _intraday_block(digest: DailyDigest) -> str:
+    experiment = digest.intraday_experiment
+    if experiment is None:
+        return "**15分钟执行实验：未运行**"
+    if experiment.error:
+        return f"**15分钟执行实验：暂不可用**\n{experiment.error}。"
+    accepted = sum(item.accepted for item in experiment.decisions)
+    lines = [f"**15分钟执行影子实验**（信号 {experiment.signal_date}）",
+             f"09:45接受 **{accepted}/{len(experiment.decisions)}**；主模拟账户暂不受影响。"]
+    for item in experiment.decisions:
+        if item.accepted and item.delayed_price is not None:
+            improvement = item.baseline_open / item.delayed_price - 1
+            lines.append(f"- {item.symbol} 通过 · 开盘 {item.baseline_open:.3f} → 09:45 {item.delayed_price:.3f}"
+                         f" · 买价改善 {improvement:+.2%}")
+        else:
+            lines.append(f"- {item.symbol} 过滤 · {item.reason}")
+    return "\n".join(lines)
+
+
 def build_card(digest: DailyDigest) -> dict[str, Any]:
     """构造 interactive 卡片（v1 结构：elements 在顶层）。
 
@@ -288,6 +309,8 @@ def build_card(digest: DailyDigest) -> dict[str, Any]:
     elements.append({"tag": "div", "text": {"tag": "lark_md", "content": _candidate_block(digest)}})
     elements.append({"tag": "hr"})
     elements.append({"tag": "div", "text": {"tag": "lark_md", "content": _backtest_block(digest)}})
+    elements.append({"tag": "hr"})
+    elements.append({"tag": "div", "text": {"tag": "lark_md", "content": _intraday_block(digest)}})
     elements.append({"tag": "hr"})
     elements.append({"tag": "div", "text": {"tag": "lark_md", "content": _paper_block(digest)}})
     elements.append({"tag": "hr"})

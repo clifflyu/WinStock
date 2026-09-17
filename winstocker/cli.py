@@ -21,6 +21,7 @@ from .calendar import ensure_calendar, refresh_calendar, trading_days_between
 from .candidates import Candidate, momentum_candidates
 from .evaluation import compare_buy_and_hold
 from .gate import evaluate_gate
+from .intraday import run_execution_experiment
 from .notify import (ERROR_MAX_CHARS, SECRET_ENV, WEBHOOK_ENV, DailyDigest, NotifyTarget, PreviousPoolBacktest,
                      build_card, build_test_card, credential, require_credential, send_card)
 from .paper import (account_status, create_account, enable_auto_strategy, mark_account,
@@ -695,6 +696,25 @@ def run_paper_rebalance(args: argparse.Namespace) -> None:
         conn.close()
 
 
+def run_minute_experiment(args: argparse.Namespace) -> None:
+    conn = connect(args.db)
+    try:
+        trade_date = args.as_of or audit_database(conn).latest_day
+        if not trade_date:
+            raise ValueError("没有完整覆盖交易日，无法运行分钟执行实验")
+        result = run_execution_experiment(conn, trade_date, args.top_n)
+        if result.error:
+            print(f"15分钟执行实验暂不可用：{result.error}")
+            return
+        print(f"15分钟执行实验：信号日 {result.signal_date}，成交观察日 {result.trade_date}")
+        for item in result.decisions:
+            delayed = "-" if item.delayed_price is None else f"{item.delayed_price:.3f}"
+            print(f"{item.symbol} {'通过' if item.accepted else '过滤'} | 开盘 {item.baseline_open:.3f} | "
+                  f"09:45 {delayed} | {item.reason}")
+    finally:
+        conn.close()
+
+
 def run_check(args: argparse.Namespace) -> None:
     symbols = tuple(item.strip() for item in args.symbols.split(",") if item.strip())
     conn = connect(args.db)
@@ -861,6 +881,14 @@ def run_daily(args: argparse.Namespace) -> None:
         conn = connect(args.db)
         digest = build_digest(conn, options, update_error, rows_added, now)
         if digest.data_date and digest.audit and digest.audit.ok:
+            if not args.dry_run:
+                try:
+                    intraday = run_execution_experiment(conn, digest.data_date)
+                    digest = replace(digest, intraday_experiment=intraday)
+                    LOG.info("15分钟执行实验：%s", intraday.error or
+                             f"接受 {sum(item.accepted for item in intraday.decisions)}/{len(intraday.decisions)}")
+                except Exception as error:
+                    LOG.warning("15分钟执行实验失败：%s", str(error)[:ERROR_MAX_CHARS])
             try:
                 automatic_backtest = run_previous_pool_backtest(conn, digest.data_date)
                 digest = replace(digest, previous_pool_backtest=automatic_backtest)
@@ -1038,6 +1066,9 @@ def parser() -> argparse.ArgumentParser:
     paper_rebalance = sub.add_parser("paper-rebalance", help="按上一候选快照执行一次本地模拟调仓")
     paper_rebalance.add_argument("--name", default="momentum-10k")
     paper_rebalance.add_argument("--as-of", help="模拟成交日，默认最近完整覆盖日")
+    minute_experiment = sub.add_parser("minute-experiment", help="运行开盘价与09:45成交过滤的影子A/B实验")
+    minute_experiment.add_argument("--as-of", help="观察交易日，默认最近完整覆盖日")
+    minute_experiment.add_argument("--top-n", type=int, default=3)
     check = sub.add_parser("check", help="自动检查策略是否仅可进入模拟观察；绝不输出实盘许可")
     check.add_argument("--symbols", required=True, help="逗号分隔的股票池")
     check.add_argument("--benchmark", default="000300")
@@ -1101,7 +1132,7 @@ def main() -> None:
         if args.command in ("update", "daily"):
             if date.fromisoformat(args.bootstrap_start) > date.fromisoformat(args.end):
                 raise ValueError("--bootstrap-start 不能晚于 --end")
-        {"init": run_init, "update": run_update, "list": run_list, "status": run_status, "audit": run_audit, "backtest": run_backtest, "rotation": run_rotation, "validate": run_validate, "compare": run_compare, "candidates": run_candidates, "snapshot-status": run_snapshot_status, "paper-init": run_paper_init, "paper-status": run_paper_status, "paper-mark": run_paper_mark, "paper-auto-init": run_paper_auto_init, "paper-rebalance": run_paper_rebalance, "check": run_check, "daily": run_daily, "notify": run_notify}[args.command](args)
+        {"init": run_init, "update": run_update, "list": run_list, "status": run_status, "audit": run_audit, "backtest": run_backtest, "rotation": run_rotation, "validate": run_validate, "compare": run_compare, "candidates": run_candidates, "snapshot-status": run_snapshot_status, "paper-init": run_paper_init, "paper-status": run_paper_status, "paper-mark": run_paper_mark, "paper-auto-init": run_paper_auto_init, "paper-rebalance": run_paper_rebalance, "minute-experiment": run_minute_experiment, "check": run_check, "daily": run_daily, "notify": run_notify}[args.command](args)
     except Exception as error:
         LOG.error("%s", error)
         raise SystemExit(1) from error
