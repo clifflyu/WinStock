@@ -20,6 +20,7 @@ from .backtest import Bar, dual_ma_backtest, load_bars, load_panel, momentum_rot
 from .calendar import ensure_calendar, refresh_calendar, trading_days_between
 from .candidates import Candidate, momentum_candidates
 from .evaluation import compare_buy_and_hold
+from .enrichment import enrichment_status, update_financials, update_industries
 from .gate import evaluate_gate
 from .intraday import run_execution_experiment
 from .notify import (ERROR_MAX_CHARS, SECRET_ENV, WEBHOOK_ENV, DailyDigest, NotifyTarget, PreviousPoolBacktest,
@@ -716,6 +717,29 @@ def run_minute_experiment(args: argparse.Namespace) -> None:
         conn.close()
 
 
+def run_enrich(args: argparse.Namespace) -> None:
+    conn = connect(args.db)
+    try:
+        audit = audit_database(conn)
+        if not audit.latest_day:
+            raise ValueError("没有完整覆盖交易日，无法固化行业快照")
+        financial = 0 if args.industry_only else update_financials(conn, args.start, args.workers)
+        industry = 0 if args.financial_only else update_industries(conn, audit.latest_day, args.workers)
+        print(f"扩展数据更新完成：财务报告 {financial} 条，行业成员关系 {industry} 条。")
+    finally:
+        conn.close()
+
+
+def run_enrich_status(args: argparse.Namespace) -> None:
+    conn = connect(args.db)
+    try:
+        status = enrichment_status(conn)
+        print(f"财务报告：{status.financial_rows} 条，{status.financial_symbols} 只股票，最新公告 {status.latest_notice or '-'}\n"
+              f"行业快照：{status.industry_dates} 个日期，{status.industry_memberships} 条关系，最新 {status.latest_industry_date or '-'}")
+    finally:
+        conn.close()
+
+
 def run_paper_morning(args: argparse.Namespace) -> None:
     now = datetime.now(BEIJING)
     updates: tuple[PaperRebalance, ...] = ()
@@ -1092,6 +1116,12 @@ def parser() -> argparse.ArgumentParser:
     minute_experiment = sub.add_parser("minute-experiment", help="运行开盘价与09:45成交过滤的影子A/B实验")
     minute_experiment.add_argument("--as-of", help="观察交易日，默认最近完整覆盖日")
     minute_experiment.add_argument("--top-n", type=int, default=3)
+    enrich = sub.add_parser("enrich", help="更新按公告日保存的财务历史和带日期的行业快照")
+    enrich.add_argument("--start", default="2021-01-01", help="财务报告期起点，默认2021-01-01")
+    enrich.add_argument("--workers", type=int, default=6)
+    enrich.add_argument("--financial-only", action="store_true")
+    enrich.add_argument("--industry-only", action="store_true")
+    sub.add_parser("enrich-status", help="查看财务与行业扩展数据状态")
     paper_morning = sub.add_parser("paper-morning", help="09:45按前夜计划执行模拟成交并推送飞书")
     paper_morning.add_argument("--webhook", help=f"飞书机器人 Webhook，默认读 {WEBHOOK_ENV}")
     paper_morning.add_argument("--secret", help=f"飞书签名密钥，默认读 {SECRET_ENV}")
@@ -1159,7 +1189,11 @@ def main() -> None:
         if args.command in ("update", "daily"):
             if date.fromisoformat(args.bootstrap_start) > date.fromisoformat(args.end):
                 raise ValueError("--bootstrap-start 不能晚于 --end")
-        {"init": run_init, "update": run_update, "list": run_list, "status": run_status, "audit": run_audit, "backtest": run_backtest, "rotation": run_rotation, "validate": run_validate, "compare": run_compare, "candidates": run_candidates, "snapshot-status": run_snapshot_status, "paper-init": run_paper_init, "paper-status": run_paper_status, "paper-mark": run_paper_mark, "paper-auto-init": run_paper_auto_init, "paper-rebalance": run_paper_rebalance, "paper-morning": run_paper_morning, "minute-experiment": run_minute_experiment, "check": run_check, "daily": run_daily, "notify": run_notify}[args.command](args)
+        if args.command == "enrich":
+            date.fromisoformat(args.start)
+            if args.financial_only and args.industry_only:
+                raise ValueError("--financial-only 与 --industry-only 不能同时使用")
+        {"init": run_init, "update": run_update, "list": run_list, "status": run_status, "audit": run_audit, "enrich": run_enrich, "enrich-status": run_enrich_status, "backtest": run_backtest, "rotation": run_rotation, "validate": run_validate, "compare": run_compare, "candidates": run_candidates, "snapshot-status": run_snapshot_status, "paper-init": run_paper_init, "paper-status": run_paper_status, "paper-mark": run_paper_mark, "paper-auto-init": run_paper_auto_init, "paper-rebalance": run_paper_rebalance, "paper-morning": run_paper_morning, "minute-experiment": run_minute_experiment, "check": run_check, "daily": run_daily, "notify": run_notify}[args.command](args)
     except Exception as error:
         LOG.error("%s", error)
         raise SystemExit(1) from error

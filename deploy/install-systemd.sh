@@ -27,7 +27,8 @@ db_escaped=$(escape_sed "$db_path")
 
 tmp_unit=$(mktemp)
 tmp_morning=$(mktemp)
-trap 'rm -f "$tmp_unit" "$tmp_morning"' EXIT
+tmp_enrich=$(mktemp)
+trap 'rm -f "$tmp_unit" "$tmp_morning" "$tmp_enrich"' EXIT
 sed -e "s|__WINSTOCK_USER__|$user_escaped|g" \
     -e "s|__WINSTOCK_DIR__|$dir_escaped|g" \
     -e "s|__WINSTOCK_PYTHON__|$python_escaped|g" \
@@ -38,11 +39,18 @@ sed -e "s|__WINSTOCK_USER__|$user_escaped|g" \
     -e "s|__WINSTOCK_PYTHON__|$python_escaped|g" \
     -e "s|__WINSTOCK_DB__|$db_escaped|g" \
     "$deploy_dir/winstock-morning.service.template" > "$tmp_morning"
+sed -e "s|__WINSTOCK_USER__|$user_escaped|g" \
+    -e "s|__WINSTOCK_DIR__|$dir_escaped|g" \
+    -e "s|__WINSTOCK_PYTHON__|$python_escaped|g" \
+    -e "s|__WINSTOCK_DB__|$db_escaped|g" \
+    "$deploy_dir/winstock-enrich.service.template" > "$tmp_enrich"
 
 install -m 0644 "$tmp_unit" /etc/systemd/system/winstock-update.service
 install -m 0644 "$deploy_dir/winstock-update.timer" /etc/systemd/system/winstock-update.timer
 install -m 0644 "$tmp_morning" /etc/systemd/system/winstock-morning.service
 install -m 0644 "$deploy_dir/winstock-morning.timer" /etc/systemd/system/winstock-morning.timer
+install -m 0644 "$tmp_enrich" /etc/systemd/system/winstock-enrich.service
+install -m 0644 "$deploy_dir/winstock-enrich.timer" /etc/systemd/system/winstock-enrich.timer
 
 # ---- 飞书凭据 ----
 # 配置放项目根目录的 .env。它不是 unit 文件的一部分，也不会出现在命令行里
@@ -74,8 +82,8 @@ if ! git -C "$project_dir" check-ignore -q .env 2>/dev/null; then
 fi
 
 systemctl daemon-reload
-systemctl enable --now winstock-update.timer winstock-morning.timer
-systemctl list-timers winstock-update.timer winstock-morning.timer --all
+systemctl enable --now winstock-update.timer winstock-morning.timer winstock-enrich.timer
+systemctl list-timers winstock-update.timer winstock-morning.timer winstock-enrich.timer --all
 
 echo
 if grep -q '^WINSTOCK_FEISHU_WEBHOOK=.\+' "$notify_env"; then

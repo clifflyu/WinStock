@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh WinStock fundamentals and dated industry memberships weekly
+
+[Timer]
+OnCalendar=Sat *-*-* 08:00:00 Asia/Shanghai
+Persistent=true
+Unit=winstock-enrich.service
+
+[Install]
+WantedBy=timers.target

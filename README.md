@@ -75,6 +75,18 @@ python3 -m winstocker minute-experiment
 推送；晚间 `daily` 再按收盘价更新净值和总结。部署脚本会同时安装早盘和晚间两个
 systemd timer。重复执行不会重复成交，休市或分钟K缺失时不会虚构成交。
 
+## 财务与行业扩展数据
+
+```bash
+# 首次回填2021年以来财务历史，并固化当前行业归属
+python3 -m winstocker enrich --start 2021-01-01
+python3 -m winstocker enrich-status
+```
+
+财务报告同时保存报告期与公告日，历史研究只能读取当时已经公告的数据；行业免费源不提供
+可靠的历史变更，因此只从首次运行日起按完整交易日固化快照，不把当前行业倒填到过去。
+部署脚本会安装每周六08:00（北京时间）的 `winstock-enrich.timer` 自动更新任务。
+
 Webhook 地址是凭据，配置写在**项目根目录的 `.env`**（已在 `.gitignore` 中，本仓库
 是公开的）。仓库里附带模板 `.env.example`：
 
