@@ -48,8 +48,16 @@ python3 -m winstocker daily --no-update --dry-run
 python3 -m winstocker daily
 ```
 
-Webhook 地址是凭据，读取优先级为**命令行参数 > 环境变量**，环境变量为
-`WINSTOCK_FEISHU_WEBHOOK`（开启签名校验时另需 `WINSTOCK_FEISHU_SECRET`）。
+Webhook 地址是凭据，配置写在**项目根目录的 `.env`**（已在 `.gitignore` 中，本仓库
+是公开的）：
+
+```
+WINSTOCK_FEISHU_WEBHOOK=https://open.feishu.cn/open-apis/bot/v2/hook/xxx
+WINSTOCK_FEISHU_SECRET=          # 仅当机器人开启签名校验时填写
+```
+
+读取优先级为**命令行参数 > 环境变量 > `.env`**，环境变量名为
+`WINSTOCK_FEISHU_WEBHOOK` / `WINSTOCK_FEISHU_SECRET`。
 **完整部署步骤见 [`deploy/飞书推送部署指南.md`](deploy/飞书推送部署指南.md)。**
 
 `daily` 无论中间哪一步失败都会照常推送——用户看到沉默时无法区分「今天没事」和
@@ -75,9 +83,9 @@ sudo chown winstock:winstock data/winstock.db data/winstock.db-wal data/winstock
 sudo env WINSTOCK_USER=winstock ./deploy/install-systemd.sh
 ```
 
-安装脚本会创建 `/etc/winstock/notify.env`（`0600`，仓库外）用于存放 Webhook。
-unit 文件是全局可读的，所以密钥**不能**写进 unit 或 `ExecStart` 命令行（`ps` 同样可见），
-只能经 systemd 的 `EnvironmentFile` 注入。
+安装脚本会在项目根目录创建 `.env`（`0600`）存放 Webhook。unit 文件是全局可读的，
+所以密钥**不能**写进 unit 或 `ExecStart` 命令行（`ps` 同样可见）；`.env` 不在 unit
+里，由程序自己读取。
 
 检查运行状态：
 

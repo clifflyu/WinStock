@@ -38,7 +38,7 @@ python -m winstocker notify               # 用当前库内容发一张真实播
 python -m winstocker daily --no-update --dry-run   # 只打印卡片 JSON，不发送
 ```
 
-The webhook resolves from `--webhook` first, then `WINSTOCK_FEISHU_WEBHOOK`; the signing secret from `--secret`, then `WINSTOCK_FEISHU_SECRET`. Deployment lives in `deploy/飞书推送部署指南.md`; the credential file is `/etc/winstock/notify.env` (0600, outside the repository) because the systemd units install world-readable.
+Credentials resolve in the order `--webhook` flag, then `WINSTOCK_FEISHU_WEBHOOK`, then the `.env` file at the project root (same for `--secret` / `WINSTOCK_FEISHU_SECRET`). The `.env` file holds a real webhook, so it is listed in `.gitignore` — **this repository is public**, and a committed webhook can only be remedied by resetting the bot. `tests/test_notify.py` asserts via `git check-ignore` that it stays ignored. Deployment lives in `deploy/飞书推送部署指南.md`.
 
 ## Strategy research
 

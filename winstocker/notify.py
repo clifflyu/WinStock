@@ -10,6 +10,7 @@ import os
 import time
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Mapping
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -28,6 +29,8 @@ ERROR_MAX_CHARS = 500
 
 WEBHOOK_ENV = "WINSTOCK_FEISHU_WEBHOOK"
 SECRET_ENV = "WINSTOCK_FEISHU_SECRET"
+# 配置写在项目根目录的 .env（该文件已在 .gitignore 中，本仓库是公开的）。
+DOTENV_PATH = Path(__file__).resolve().parent.parent / ".env"
 
 # 把飞书的错误码翻译成能直接照做的中文，避免用户面对一个裸数字。
 FEISHU_ERROR_HINTS = {
@@ -101,20 +104,61 @@ def feishu_signature(secret: str, timestamp: int) -> str:
     return base64.b64encode(digest).decode("utf-8")
 
 
-def credential(flag_value: str | None, env_name: str, environ: Mapping[str, str] = os.environ) -> str | None:
-    """命令行参数优先于环境变量；空字符串一律视为未配置。"""
+def parse_dotenv(text: str) -> dict[str, str]:
+    """解析 .env：支持 # 注释、空行、可选的 export 前缀、值两侧成对的引号。
+
+    刻意不做变量展开和多行值——这个文件只有两个键，多一分解析复杂度就多一类
+    「为什么没生效」。
+    """
+    values: dict[str, str] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+        key, sep, value = line.partition("=")
+        if not sep:
+            continue
+        key, value = key.strip(), value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if key:
+            values[key] = value
+    return values
+
+
+def dotenv_values(path: Path = DOTENV_PATH) -> dict[str, str]:
+    """读 .env。文件不存在或不可读都返回空字典——配置缺失由调用方给出提示。"""
+    try:
+        return parse_dotenv(path.read_text(encoding="utf-8"))
+    except OSError:
+        return {}
+
+
+def credential(flag_value: str | None, env_name: str, environ: Mapping[str, str] = os.environ,
+               dotenv: Mapping[str, str] | None = None) -> str | None:
+    """按 命令行参数 > 环境变量 > .env 取配置；空字符串一律视为未配置。
+
+    真实环境变量优先于 .env，与 python-dotenv 的约定一致，也与 systemd 单元被
+    临时覆盖时的直觉一致。
+    """
     if flag_value and flag_value.strip():
         return flag_value.strip()
     value = environ.get(env_name, "").strip()
-    return value or None
+    if value:
+        return value
+    source = dotenv_values() if dotenv is None else dotenv
+    return source.get(env_name, "").strip() or None
 
 
 def require_credential(flag_value: str | None, env_name: str, label: str,
-                       environ: Mapping[str, str] = os.environ) -> str:
-    value = credential(flag_value, env_name, environ)
+                       environ: Mapping[str, str] = os.environ,
+                       dotenv: Mapping[str, str] | None = None) -> str:
+    value = credential(flag_value, env_name, environ, dotenv)
     if value is None:
         raise RuntimeError(
-            f"未配置{label}。请写入环境变量 {env_name}，"
+            f"未配置{label}。请在 {DOTENV_PATH} 里写一行 {env_name}=...，"
             f"或临时用命令行参数指定（参见 deploy/飞书推送部署指南.md）"
         )
     return value

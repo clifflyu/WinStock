@@ -37,19 +37,16 @@ install -m 0644 "$tmp_unit" /etc/systemd/system/winstock-update.service
 install -m 0644 "$deploy_dir/winstock-update.timer" /etc/systemd/system/winstock-update.timer
 
 # ---- 飞书凭据 ----
-# unit 文件以 0644 安装、全局可读，所以 Webhook 绝不能写进 unit 或 ExecStart 命令行
-# （ps 也全局可见）。只能经 EnvironmentFile 注入，文件本身锁到 0600。
-notify_dir=/etc/winstock
-notify_env="$notify_dir/notify.env"
-
-install -d -m 0750 -o root -g root "$notify_dir"
+# 配置放项目根目录的 .env。它不是 unit 文件的一部分，也不会出现在命令行里
+# （ps 全局可见），所以只要保证不被提交即可——.gitignore 已单列 .env。
+notify_env="$project_dir/.env"
 
 if [[ ! -e "$notify_env" ]]; then
   # 只在首次创建，重复安装绝不覆盖已有的真实密钥。
   umask 077
   cat > "$notify_env" <<'ENVEOF'
-# WinStock 飞书播报配置。此文件含密钥，请勿提交到版本库，勿改为 644。
-# 注意：systemd 不解析引号，值两侧不要加 " 或 '。
+# WinStock 飞书播报配置。此文件含密钥：本仓库是公开的，请勿提交、勿改为 644。
+# 值两侧可以加引号，也可以不加（由 Python 解析，不是 systemd 解析）。
 WINSTOCK_FEISHU_WEBHOOK=
 WINSTOCK_FEISHU_SECRET=
 ENVEOF
@@ -62,7 +59,12 @@ if [[ -n "${WINSTOCK_FEISHU_WEBHOOK:-}" ]]; then
 fi
 
 chmod 0600 "$notify_env"
-chown root:root "$notify_env"
+
+# 兜底自检：密钥一旦被提交就会永久留在 git 历史里，这里当场发现当场拦。
+if ! git -C "$project_dir" check-ignore -q .env 2>/dev/null; then
+  echo "⚠  警告：$project_dir/.env 未被 git 忽略！" >&2
+  echo "   本仓库是公开的，提交它等于公开你的飞书 Webhook。请确认 .gitignore 含 .env。" >&2
+fi
 
 systemctl daemon-reload
 systemctl enable --now winstock-update.timer

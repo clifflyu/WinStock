@@ -2,16 +2,23 @@ import base64
 import hashlib
 import hmac
 import json
+import shutil
 import sqlite3
+import subprocess
 import unittest
 from datetime import date, datetime, timedelta
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from winstocker.audit import DataAudit
 from winstocker.candidates import Candidate
 from winstocker.cli import DigestOptions, build_digest
-from winstocker.notify import (ERROR_MAX_CHARS, FEISHU_MAX_BODY, SECRET_ENV, WEBHOOK_ENV, DailyDigest,
-                               build_card, build_payload, build_test_card, credential, feishu_signature,
-                               format_amount, format_momentum, require_credential)
+from winstocker.notify import (DOTENV_PATH, ERROR_MAX_CHARS, FEISHU_MAX_BODY, SECRET_ENV, WEBHOOK_ENV,
+                               DailyDigest, build_card, build_payload, build_test_card, credential,
+                               dotenv_values, feishu_signature, format_amount, format_momentum,
+                               parse_dotenv, require_credential)
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 NOW = datetime(2026, 9, 17, 19, 35, 12)
 
@@ -105,17 +112,75 @@ class NotifyTests(unittest.TestCase):
         self.assertEqual(len(worst.update_error), ERROR_MAX_CHARS)
 
     def test_credential_prefers_flag_over_env(self):
-        env = {WEBHOOK_ENV: "https://env"}
-        self.assertEqual(credential("https://flag", WEBHOOK_ENV, env), "https://flag")
-        self.assertEqual(credential(None, WEBHOOK_ENV, env), "https://env")
-        self.assertIsNone(credential(None, WEBHOOK_ENV, {}))
-        # 空串与纯空白都不算「已配置」，否则 systemd 里留空的变量会被当成有效值。
-        self.assertIsNone(credential(None, SECRET_ENV, {SECRET_ENV: "  "}))
-        # 空 flag 等同于没传，继续回退到环境变量。
-        self.assertEqual(credential("", WEBHOOK_ENV, env), "https://env")
-        self.assertEqual(credential("   ", WEBHOOK_ENV, {"WINSTOCK_FEISHU_WEBHOOK": "  "}), None)
+        # 一律显式传空的 dotenv：默认值会去读项目根目录那个真实的 .env，让测试结果
+        # 取决于开发机上有没有配置文件——同一份代码在不同机器上时红时绿。
+        env, empty = {WEBHOOK_ENV: "https://env"}, {}
+        self.assertEqual(credential("https://flag", WEBHOOK_ENV, env, empty), "https://flag")
+        self.assertEqual(credential(None, WEBHOOK_ENV, env, empty), "https://env")
+        self.assertIsNone(credential(None, WEBHOOK_ENV, empty, empty))
+        # 空串与纯空白都不算「已配置」，否则配置文件里留空的键会被当成有效值。
+        self.assertIsNone(credential(None, SECRET_ENV, {SECRET_ENV: "  "}, empty))
+        # 空 flag 等同于没传，继续回退。
+        self.assertEqual(credential("", WEBHOOK_ENV, env, empty), "https://env")
+        self.assertIsNone(credential("   ", WEBHOOK_ENV, {WEBHOOK_ENV: "  "}, empty))
         with self.assertRaises(RuntimeError):
-            require_credential(None, WEBHOOK_ENV, "飞书 Webhook 地址", {})
+            require_credential(None, WEBHOOK_ENV, "飞书 Webhook 地址", empty, empty)
+
+    def test_dotenv_parsing(self):
+        parsed = parse_dotenv(
+            "# 注释行\n"
+            "\n"
+            "   \n"
+            "WINSTOCK_FEISHU_WEBHOOK=https://open.feishu.cn/open-apis/bot/v2/hook/abc\n"
+            "export WINSTOCK_FEISHU_SECRET='quoted'\n"
+            "WINSTOCK_FEISHU_SECRET_DQ=\"double\"\n"
+            "  空格键 =  值两边有空格  \n"
+            "没有等号的行\n"
+            "EMPTY=\n"
+        )
+        self.assertEqual(parsed["WINSTOCK_FEISHU_WEBHOOK"],
+                         "https://open.feishu.cn/open-apis/bot/v2/hook/abc")
+        self.assertEqual(parsed["WINSTOCK_FEISHU_SECRET"], "quoted")
+        self.assertEqual(parsed["WINSTOCK_FEISHU_SECRET_DQ"], "double")
+        self.assertEqual(parsed["空格键"], "值两边有空格")
+        self.assertEqual(parsed["EMPTY"], "")
+        self.assertNotIn("没有等号的行", parsed)
+
+    def test_credential_falls_back_to_dotenv(self):
+        dotenv = {WEBHOOK_ENV: "https://dotenv", SECRET_ENV: "s"}
+        # 优先级：命令行参数 > 环境变量 > .env
+        self.assertEqual(credential("https://flag", WEBHOOK_ENV, {WEBHOOK_ENV: "https://env"}, dotenv),
+                         "https://flag")
+        self.assertEqual(credential(None, WEBHOOK_ENV, {WEBHOOK_ENV: "https://env"}, dotenv),
+                         "https://env")
+        self.assertEqual(credential(None, WEBHOOK_ENV, {}, dotenv), "https://dotenv")
+        # .env 里键存在但值为空，等同于未配置。
+        self.assertIsNone(credential(None, WEBHOOK_ENV, {}, {WEBHOOK_ENV: "  "}))
+
+    def test_dotenv_values_reads_file_and_survives_missing_one(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / ".env"
+            path.write_text("A=1\n# 注释\nB='2'\n", encoding="utf-8")
+            self.assertEqual(dotenv_values(path), {"A": "1", "B": "2"})
+            # 文件不存在不能抛异常：配置缺失由 require_credential 给出可读提示。
+            self.assertEqual(dotenv_values(Path(directory) / "没有这个文件"), {})
+
+    def test_dotenv_lives_at_project_root(self):
+        # 路径必须相对包定位，否则从别的目录调用时会去读 cwd 下的 .env。
+        self.assertEqual(DOTENV_PATH, PROJECT_ROOT / ".env")
+
+    @unittest.skipIf(shutil.which("git") is None, "需要 git")
+    def test_env_file_must_stay_gitignored(self):
+        """本仓库是公开的：.env 一旦被提交，Webhook 就永久留在 git 历史里。
+
+        这条测试直接问 git 本身，而不是读 .gitignore 文本——`env/` 这种写法看着像
+        覆盖了 .env 其实只匹配同名目录，只有真正的匹配引擎才作数。
+        """
+        result = subprocess.run(["git", "-C", str(PROJECT_ROOT), "check-ignore", "-q", ".env"],
+                                capture_output=True, text=True)
+        if result.returncode not in (0, 1):
+            self.skipTest("当前目录不是 git 仓库")
+        self.assertEqual(result.returncode, 0, ".env 未被 .gitignore 忽略，提交它会泄漏飞书 Webhook")
 
     def test_test_card_needs_no_database(self):
         card = build_test_card(NOW, secret_configured=False)
