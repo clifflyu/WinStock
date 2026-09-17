@@ -16,6 +16,7 @@ class Bar:
     day: str
     open: float
     close: float
+    amount: float | None = None
 
 
 @dataclass
@@ -65,9 +66,9 @@ def load_bars(conn: sqlite3.Connection, symbol: str, start: str | None, end: str
         clauses.append("trade_date <= ?")
         values.append(end)
     rows = conn.execute(
-        "SELECT trade_date, open, close FROM daily_kline WHERE " + " AND ".join(clauses) + " ORDER BY trade_date", values
+        "SELECT trade_date, open, close, amount FROM daily_kline WHERE " + " AND ".join(clauses) + " ORDER BY trade_date", values
     )
-    return [Bar(day, float(open_), float(close)) for day, open_, close in rows]
+    return [Bar(day, float(open_), float(close), float(amount) if amount is not None else None) for day, open_, close, amount in rows]
 
 
 def load_panel(conn: sqlite3.Connection, symbols: Iterable[str], start: str | None, end: str | None) -> dict[str, dict[str, Bar]]:
@@ -84,11 +85,11 @@ def load_panel(conn: sqlite3.Connection, symbols: Iterable[str], start: str | No
         clauses.append("trade_date <= ?")
         values.append(end)
     rows = conn.execute(
-        "SELECT symbol, trade_date, open, close FROM daily_kline WHERE " + " AND ".join(clauses) + " ORDER BY trade_date", values
+        "SELECT symbol, trade_date, open, close, amount FROM daily_kline WHERE " + " AND ".join(clauses) + " ORDER BY trade_date", values
     )
     panel = {symbol: {} for symbol in symbols}
-    for symbol, day, open_, close in rows:
-        panel[symbol][day] = Bar(day, float(open_), float(close))
+    for symbol, day, open_, close, amount in rows:
+        panel[symbol][day] = Bar(day, float(open_), float(close), float(amount) if amount is not None else None)
     return panel
 
 
@@ -164,11 +165,12 @@ def dual_ma_backtest(
 def momentum_rotation_backtest(
     panel: dict[str, dict[str, Bar]], top_n: int = 5, lookback: int = 20, rebalance_every: int = 20,
     initial_cash: float = 100_000, commission_rate: float = 0.0003, minimum_commission: float = 5,
-    stamp_duty_rate: float = 0.0005, slippage_bps: float = 5,
+    stamp_duty_rate: float = 0.0005, slippage_bps: float = 5, min_history: int = 0, min_avg_amount: float = 0,
+    initial_history: int = 0,
 ) -> RotationResult:
     """Equal-weight top-momentum rotation using only data available before each rebalance open."""
-    if top_n < 1 or lookback < 1 or rebalance_every < 1:
-        raise ValueError("top_n、lookback 和 rebalance_every 必须为正整数")
+    if top_n < 1 or lookback < 1 or rebalance_every < 1 or min_history < 0 or min_avg_amount < 0 or initial_history < 0:
+        raise ValueError("策略窗口为正整数，股票历史与成交额门槛不能为负数")
     days = sorted({day for bars in panel.values() for day in bars})
     if len(days) <= lookback:
         raise ValueError(f"数据不足：动量策略至少需要 {lookback + 1} 个交易日")
@@ -187,8 +189,14 @@ def momentum_rotation_backtest(
             previous_day, base_day = days[i - 1], days[i - lookback]
             ranks = []
             for symbol, bars in panel.items():
-                if base_day in bars and previous_day in bars and day in bars:
-                    ranks.append((bars[previous_day].close / bars[base_day].close - 1, symbol))
+                recent = [bars.get(candidate_day) for candidate_day in days[i - lookback:i]]
+                history_count = initial_history + sum(1 for candidate_day in days[:i] if candidate_day in bars)
+                if base_day not in bars or previous_day not in bars or day not in bars or history_count < min_history or any(bar is None for bar in recent):
+                    continue
+                amounts = [bar.amount for bar in recent]
+                if min_avg_amount and (any(amount is None for amount in amounts) or sum(amounts) / len(amounts) < min_avg_amount):
+                    continue
+                ranks.append((bars[previous_day].close / bars[base_day].close - 1, symbol))
             targets = {symbol for _, symbol in sorted(ranks, reverse=True)[:top_n]}
             rebalances += 1
 
@@ -252,4 +260,5 @@ def walk_forward_rotation(panel: dict[str, dict[str, Bar]], train_ratio: float =
     train_days, validation_days = set(days[:split]), set(days[split:])
     train_panel = {symbol: {day: bar for day, bar in bars.items() if day in train_days} for symbol, bars in panel.items()}
     validation_panel = {symbol: {day: bar for day, bar in bars.items() if day in validation_days} for symbol, bars in panel.items()}
-    return WalkForwardResult(days[split], momentum_rotation_backtest(train_panel, **kwargs), momentum_rotation_backtest(validation_panel, **kwargs))
+    validation_kwargs = {**kwargs, "initial_history": split}
+    return WalkForwardResult(days[split], momentum_rotation_backtest(train_panel, **kwargs), momentum_rotation_backtest(validation_panel, **validation_kwargs))

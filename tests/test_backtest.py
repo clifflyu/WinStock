@@ -41,6 +41,12 @@ class BacktestTests(unittest.TestCase):
         self.assertEqual(result.trades, 1)
         self.assertGreater(result.final_value, 10_000)
 
+    def test_rotation_excludes_insufficient_liquidity(self):
+        days = [f"2024-01-{i:02d}" for i in range(1, 8)]
+        panel = {"600000": {day: Bar(day, 10 + i, 10 + i, 100) for i, day in enumerate(days)}}
+        result = momentum_rotation_backtest(panel, top_n=1, lookback=3, rebalance_every=10, initial_cash=10_000, commission_rate=0, minimum_commission=0, stamp_duty_rate=0, slippage_bps=0, min_history=3, min_avg_amount=1_000)
+        self.assertEqual(result.trades, 0)
+
     def test_audit_detects_missing_and_lagging_data(self):
         conn = sqlite3.connect(":memory:")
         conn.executescript("""

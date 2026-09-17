@@ -456,6 +456,7 @@ def run_rotation(args: argparse.Namespace) -> None:
         result = momentum_rotation_backtest(
             load_panel(conn, symbols, args.start, args.end), args.top_n, args.lookback, args.rebalance_every,
             args.cash, args.commission, args.min_commission, args.stamp_duty, args.slippage_bps,
+            args.min_history, args.min_avg_amount,
         )
         annualized = "-" if result.annualized_return is None else f"{result.annualized_return:.2%}"
         print(
@@ -471,7 +472,7 @@ def run_rotation(args: argparse.Namespace) -> None:
                 "symbols": symbols, "top_n": args.top_n, "lookback": args.lookback,
                 "rebalance_every": args.rebalance_every, "cash": args.cash, "commission": args.commission,
                 "min_commission": args.min_commission, "stamp_duty": args.stamp_duty,
-                "slippage_bps": args.slippage_bps,
+                "slippage_bps": args.slippage_bps, "min_history": args.min_history, "min_avg_amount": args.min_avg_amount,
             }, result)
             print(f"研究报告：{path}")
     finally:
@@ -486,7 +487,8 @@ def run_validate(args: argparse.Namespace) -> None:
             load_panel(conn, symbols, args.start, args.end), args.train_ratio, top_n=args.top_n,
             lookback=args.lookback, rebalance_every=args.rebalance_every, initial_cash=args.cash,
             commission_rate=args.commission, minimum_commission=args.min_commission,
-            stamp_duty_rate=args.stamp_duty, slippage_bps=args.slippage_bps,
+            stamp_duty_rate=args.stamp_duty, slippage_bps=args.slippage_bps, min_history=args.min_history,
+            min_avg_amount=args.min_avg_amount,
         )
         def summary(label: str, item: Any) -> str:
             annualized = "-" if item.annualized_return is None else f"{item.annualized_return:.2%}"
@@ -498,6 +500,7 @@ def run_validate(args: argparse.Namespace) -> None:
                 "lookback": args.lookback, "rebalance_every": args.rebalance_every, "cash": args.cash,
                 "commission": args.commission, "min_commission": args.min_commission,
                 "stamp_duty": args.stamp_duty, "slippage_bps": args.slippage_bps,
+                "min_history": args.min_history, "min_avg_amount": args.min_avg_amount,
             }, result)
             print(f"研究报告：{path}")
     finally:
@@ -519,6 +522,7 @@ def run_compare(args: argparse.Namespace) -> None:
         result = momentum_rotation_backtest(
             load_panel(conn, symbols, args.start, args.end), args.top_n, args.lookback, args.rebalance_every,
             args.cash, args.commission, args.min_commission, args.stamp_duty, args.slippage_bps,
+            args.min_history, args.min_avg_amount,
         )
         raw = fetch_kline_bars(index_code(args.benchmark), result.start, result.end, "qfq")
         bars = [Bar(day, float(row[1]), float(row[2])) for day, row in raw.items() if len(row) > 2]
@@ -533,6 +537,7 @@ def run_compare(args: argparse.Namespace) -> None:
                 "symbols": symbols, "benchmark": args.benchmark, "top_n": args.top_n, "lookback": args.lookback,
                 "rebalance_every": args.rebalance_every, "cash": args.cash, "commission": args.commission,
                 "min_commission": args.min_commission, "stamp_duty": args.stamp_duty, "slippage_bps": args.slippage_bps,
+                "min_history": args.min_history, "min_avg_amount": args.min_avg_amount,
             }, result, comparison)
             print(f"研究报告：{path}")
     finally:
@@ -581,6 +586,8 @@ def parser() -> argparse.ArgumentParser:
     rotation.add_argument("--min-commission", type=float, default=5, help="单笔最低佣金，默认 5 元")
     rotation.add_argument("--stamp-duty", type=float, default=0.0005, help="卖出印花税率，默认万五")
     rotation.add_argument("--slippage-bps", type=float, default=5, help="单边滑点（bp），默认 5")
+    rotation.add_argument("--min-history", type=int, default=250, help="至少具备的历史交易日数，默认 250")
+    rotation.add_argument("--min-avg-amount", type=float, default=20_000_000, help="近 lookback 日平均成交额下限（元），默认 2000 万")
     rotation.add_argument("--output", type=Path, help="将可复现的 JSON 研究报告写入此路径")
     validate = sub.add_parser("validate", help="动量轮动的训练/样本外验证，防止只看历史拟合")
     validate.add_argument("--symbols", required=True, help="逗号分隔的股票池，例如 600000,000001,300750")
@@ -595,6 +602,8 @@ def parser() -> argparse.ArgumentParser:
     validate.add_argument("--min-commission", type=float, default=5)
     validate.add_argument("--stamp-duty", type=float, default=0.0005)
     validate.add_argument("--slippage-bps", type=float, default=5)
+    validate.add_argument("--min-history", type=int, default=250)
+    validate.add_argument("--min-avg-amount", type=float, default=20_000_000)
     validate.add_argument("--output", type=Path, help="将训练/验证结果写入 JSON 报告")
     compare = sub.add_parser("compare", help="将动量轮动与市场基准的买入持有收益比较")
     compare.add_argument("--symbols", required=True, help="逗号分隔的股票池")
@@ -609,6 +618,8 @@ def parser() -> argparse.ArgumentParser:
     compare.add_argument("--min-commission", type=float, default=5)
     compare.add_argument("--stamp-duty", type=float, default=0.0005)
     compare.add_argument("--slippage-bps", type=float, default=5)
+    compare.add_argument("--min-history", type=int, default=250)
+    compare.add_argument("--min-avg-amount", type=float, default=20_000_000)
     compare.add_argument("--output", type=Path, help="将策略与基准比较写入 JSON 报告")
     return app
 
