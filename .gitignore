@@ -10,6 +10,11 @@ data/
 # 例：python -m winstocker init 2>&1 | tee init.log
 *.log
 
+# ---- 密钥 ----
+# 飞书 Webhook 是凭据：任何拿到它的人都能往群里发消息。
+# 正式位置是 /etc/winstock/notify.env（0600），这里只是兜住误放到项目里的情况。
+notify.env
+
 # ---- Python ----
 __pycache__/
 *.py[cod]

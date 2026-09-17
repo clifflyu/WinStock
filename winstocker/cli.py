@@ -8,18 +8,21 @@ import math
 import sqlite3
 import sys
 import time
-from datetime import date, datetime, timedelta
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from .audit import audit_database, scale_drift
+from .audit import DataAudit, audit_database, scale_drift
 from .backtest import Bar, dual_ma_backtest, load_bars, load_panel, momentum_rotation_backtest, walk_forward_rotation
 from .calendar import ensure_calendar, refresh_calendar, trading_days_between
-from .candidates import momentum_candidates
+from .candidates import Candidate, momentum_candidates
 from .evaluation import compare_buy_and_hold
 from .gate import evaluate_gate
+from .notify import (ERROR_MAX_CHARS, SECRET_ENV, WEBHOOK_ENV, DailyDigest, NotifyTarget,
+                     build_card, build_test_card, credential, require_credential, send_card)
 from .paper import account_status, create_account, mark_account
 from .reporting import write_backtest_report, write_comparison_report, write_walk_forward_report
 from .robustness import walk_forward_robustness
@@ -35,6 +38,8 @@ KLINE_MAX_PAGES = 40  # 翻页安全上限，正常区间远用不到
 EX_DIV_TOLERANCE = 0.01  # 复权因子相对变化超过此值即认定当天除权
 SHARES_BOARD = ("688", "689")  # 科创板代码前缀，其成交量腾讯按股返回
 DEFAULT_DB = Path("data/winstock.db")
+# 北京时间固定 UTC+8、无夏令时，用固定偏移即可；zoneinfo 在精简容器里可能缺 tzdata。
+BEIJING = timezone(timedelta(hours=8))
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 # 数值列以定点整数存储（乘以缩放系数后取整），体积约为 REAL 的一半；
@@ -134,6 +139,9 @@ def connect(db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
+    # 默认 busy_timeout 为 0：定时任务与手动 init/update 撞上时 sqlite 会立刻抛
+    # "database is locked"。等 30 秒足够让另一个写事务结束，消除一整类偶发失败。
+    conn.execute("PRAGMA busy_timeout=30000")
     migrate_legacy(conn)
     conn.executescript(KLINE_SCHEMA)
     # 日历与停牌表在升级后的第一次运行时惰性建立；此后开销仅为一次 COUNT。
@@ -442,30 +450,34 @@ def run_status(args: argparse.Namespace) -> None:
         conn.close()
 
 
+def audit_report_text(report: DataAudit, max_lag_days: int) -> str:
+    """渲染审计结论。终端与 journal 共用同一份口径，避免两处描述漂移。"""
+    verdict = "通过" if report.ok else "需检查（不要直接相信回测结果）"
+    unlisted = report.no_data_symbols - report.no_data_failed
+    suspended_lag = report.lagging_symbols - report.lagging_failed
+    if report.broken_change_rows:
+        consistency = (f"异常：{report.broken_change_rows} 行的涨跌额与相邻收盘价不符，"
+                       f"疑似前复权尺度漂移（重跑完整 init 或 update 可修复）")
+    else:
+        consistency = "通过（无尺度漂移）"
+    return (
+        f"数据审计：{verdict}\n数据库完整性：{report.integrity}\n"
+        f"活跃证券：{report.active_securities}\n有日线证券：{report.symbols_with_bars}\n"
+        f"日线总数：{report.rows}\n完整覆盖截至：{report.latest_day or '-'}（{report.latest_day_symbols} 只）\n"
+        f"最新观测日：{report.newest_observed_day or '-'}（{report.newest_observed_symbols} 只）\n"
+        f"无日线证券：{report.no_data_symbols}（抓取失败 {report.no_data_failed}，未上市 {unlisted}）\n"
+        f"落后最新日超过 {max_lag_days} 天：{report.lagging_symbols} 只"
+        f"（停牌 {suspended_lag}，真实落后 {report.lagging_failed}）\n"
+        f"区间内停牌股票：{report.suspended_symbols} 只\n"
+        f"前复权序列自洽性：{consistency}\n"
+        f"下载失败待重试：{report.failures}"
+    )
+
+
 def run_audit(args: argparse.Namespace) -> None:
     conn = connect(args.db)
     try:
-        report = audit_database(conn, args.max_lag_days)
-        verdict = "通过" if report.ok else "需检查（不要直接相信回测结果）"
-        unlisted = report.no_data_symbols - report.no_data_failed
-        suspended_lag = report.lagging_symbols - report.lagging_failed
-        if report.broken_change_rows:
-            consistency = (f"异常：{report.broken_change_rows} 行的涨跌额与相邻收盘价不符，"
-                           f"疑似前复权尺度漂移（重跑完整 init 或 update 可修复）")
-        else:
-            consistency = "通过（无尺度漂移）"
-        print(
-            f"数据审计：{verdict}\n数据库完整性：{report.integrity}\n"
-            f"活跃证券：{report.active_securities}\n有日线证券：{report.symbols_with_bars}\n"
-            f"日线总数：{report.rows}\n完整覆盖截至：{report.latest_day or '-'}（{report.latest_day_symbols} 只）\n"
-            f"最新观测日：{report.newest_observed_day or '-'}（{report.newest_observed_symbols} 只）\n"
-            f"无日线证券：{report.no_data_symbols}（抓取失败 {report.no_data_failed}，未上市 {unlisted}）\n"
-            f"落后最新日超过 {args.max_lag_days} 天：{report.lagging_symbols} 只"
-            f"（停牌 {suspended_lag}，真实落后 {report.lagging_failed}）\n"
-            f"区间内停牌股票：{report.suspended_symbols} 只\n"
-            f"前复权序列自洽性：{consistency}\n"
-            f"下载失败待重试：{report.failures}"
-        )
+        print(audit_report_text(audit_database(conn, args.max_lag_days), args.max_lag_days))
     finally:
         conn.close()
 
@@ -687,6 +699,159 @@ def run_check(args: argparse.Namespace) -> None:
         conn.close()
 
 
+@dataclass(frozen=True)
+class DigestOptions:
+    """build_digest 的查询参数；与 argparse 解耦，便于直接构造测试。"""
+    top_n: int = 10
+    lookback: int = 20
+    min_history: int = 250
+    min_avg_amount: float = 20_000_000
+    max_lag_days: int = 7
+    as_of: str | None = None
+
+
+def kline_row_count(db_path: Path) -> int | None:
+    """只读连接取行数。刻意不走 connect()——后者会顺带建表、迁移旧库、重建日历。"""
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            return conn.execute("SELECT COUNT(*) FROM kline").fetchone()[0]
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+
+
+def build_digest(conn: sqlite3.Connection, options: DigestOptions, update_error: str | None,
+                 rows_added: int | None, generated_at: datetime) -> DailyDigest:
+    """收集候选池与审计结论。读取失败降级为说明性摘要，绝不抛异常。
+
+    卡片本身能送达就是这条链路最重要的信息，所以这里宁可给出「不可用」也不要炸掉。
+    """
+    audit: DataAudit | None = None
+    data_error: str | None = None
+    picks: tuple[Candidate, ...] = ()
+    snapshot_latest: str | None = None
+    try:
+        audit = audit_database(conn, options.max_lag_days)
+        # 显式传入 as_of：momentum_candidates 在 as_of=None 时会自己再跑一遍
+        # audit_database（含全库 integrity_check 与一次全表窗口函数），复用刚拿到的结果。
+        picks = tuple(momentum_candidates(
+            conn, options.as_of or audit.latest_day, options.top_n,
+            options.lookback, options.min_history, options.min_avg_amount))
+    except Exception as error:
+        data_error = str(error)[:ERROR_MAX_CHARS]
+        LOG.warning("读取候选池或审计失败：%s", data_error)
+    try:
+        snapshot_latest = snapshot_status(conn)[2]
+    except Exception:
+        pass
+    return DailyDigest(generated_at=generated_at, data_date=audit.latest_day if audit else None,
+                       update_error=update_error, data_error=data_error, audit=audit, candidates=picks,
+                       lookback=options.lookback, min_history=options.min_history,
+                       min_avg_amount=options.min_avg_amount, snapshot_latest=snapshot_latest,
+                       rows_added=rows_added)
+
+
+def degraded_digest(options: DigestOptions, update_error: str | None, data_error: str,
+                    generated_at: datetime) -> DailyDigest:
+    """连数据库都打不开时的摘要——仍然要发得出去。"""
+    return DailyDigest(generated_at=generated_at, data_date=None, update_error=update_error,
+                       data_error=data_error, audit=None, candidates=(),
+                       lookback=options.lookback, min_history=options.min_history,
+                       min_avg_amount=options.min_avg_amount)
+
+
+def digest_options(args: argparse.Namespace) -> DigestOptions:
+    return DigestOptions(top_n=args.top_n, lookback=args.lookback, min_history=args.min_history,
+                         min_avg_amount=args.min_avg_amount, max_lag_days=args.max_lag_days,
+                         as_of=args.as_of)
+
+
+def push_card(args: argparse.Namespace, card: dict[str, Any], note: str = "") -> None:
+    """发送一张卡片；--dry-run 只打印，且不需要任何凭据。"""
+    if args.dry_run:
+        print(json.dumps(card, ensure_ascii=False, indent=2))
+        print(f"（--dry-run：未发送{note}）")
+        return
+    webhook = require_credential(args.webhook, WEBHOOK_ENV, "飞书 Webhook 地址")
+    send_card(NotifyTarget(webhook, credential(args.secret, SECRET_ENV)), card)
+
+
+def run_daily(args: argparse.Namespace) -> None:
+    """每日全流程：更新数据 → 审计 → 候选池 → 推送飞书。
+
+    无论中间哪一步失败都照常推送：用户看到沉默时无法区分「今天没事」和「整条链路
+    已经死了」。退出码区分失败面，让 systemd 能把 unit 标成 failed。
+    """
+    now = datetime.now(BEIJING)
+    update_error: str | None = None
+    rows_added: int | None = None
+    if args.no_update:
+        LOG.info("已指定 --no-update：跳过数据更新，直接用当前库内容推送。")
+    else:
+        before = kline_row_count(args.db)
+        try:
+            run_update(args)
+        except Exception as error:
+            update_error = str(error)[:ERROR_MAX_CHARS]
+            LOG.error("数据更新失败：%s", update_error)
+        else:
+            after = kline_row_count(args.db)
+            if before is not None and after is not None:
+                rows_added = after - before
+            LOG.info("数据更新完成，新增 %s 行日 K。", rows_added)
+
+    options = digest_options(args)
+    conn = None
+    try:
+        conn = connect(args.db)
+        digest = build_digest(conn, options, update_error, rows_added, now)
+    except Exception as error:
+        LOG.error("打开数据库失败：%s", error)
+        digest = degraded_digest(options, update_error, str(error)[:ERROR_MAX_CHARS], now)
+    finally:
+        if conn is not None:
+            conn.close()
+
+    if digest.audit is not None:  # 审计结论同步进 journal，保留原有的取证能力
+        for line in audit_report_text(digest.audit, args.max_lag_days).splitlines():
+            LOG.info("%s", line)
+
+    notify_error: str | None = None
+    try:
+        push_card(args, build_card(digest),
+                  f"。卡片状态 {digest.status}，标题颜色 {digest.header_template}")
+    except Exception as error:
+        notify_error = str(error)[:ERROR_MAX_CHARS]
+        LOG.error("飞书推送失败：%s", notify_error)
+
+    if update_error and notify_error:
+        LOG.error("数据未更新且通知未送达，这是最坏情况。")
+        raise SystemExit(3)
+    if update_error:
+        raise SystemExit(1)
+    if notify_error:
+        raise SystemExit(2)
+    LOG.info("每日播报完成：状态 %s，候选 %d 只。", digest.status, len(digest.candidates))
+
+
+def run_notify(args: argparse.Namespace) -> None:
+    """只推送，不碰数据。--test 发配置自检卡片（连库都不读，可单独验证飞书链路）。"""
+    now = datetime.now(BEIJING)
+    if args.test:
+        card = build_test_card(now, bool(credential(args.secret, SECRET_ENV)))
+    else:
+        conn = connect(args.db)
+        try:
+            card = build_card(build_digest(conn, digest_options(args), None, None, now))
+        finally:
+            conn.close()
+    push_card(args, card)
+    if not args.dry_run:
+        print("已发送，请查看飞书群。")
+
+
 def parser() -> argparse.ArgumentParser:
     app = argparse.ArgumentParser(description="WinStock A 股清单与日 K 初始化工具")
     app.add_argument("--db", type=Path, default=DEFAULT_DB, help="SQLite 数据库路径（默认 data/winstock.db）")
@@ -802,6 +967,33 @@ def parser() -> argparse.ArgumentParser:
     check.add_argument("--max-drawdown", type=float, default=-0.20, help="样本外最大回撤警戒线，默认 -0.20")
     check.add_argument("--min-trades", type=int, default=10)
     check.add_argument("--output", type=Path)
+    daily = sub.add_parser("daily", help="每日全流程：更新日 K、审计、生成候选池并推送到飞书群")
+    daily.add_argument("--webhook", help=f"飞书机器人 Webhook 地址，默认读环境变量 {WEBHOOK_ENV}")
+    daily.add_argument("--secret", help=f"飞书机器人签名密钥（开启签名校验时必填），默认读环境变量 {SECRET_ENV}")
+    daily.add_argument("--end", default=datetime.now(BEIJING).date().isoformat(), help="更新截止日，默认北京时间今天")
+    daily.add_argument("--bootstrap-start", default="2024-01-01", help="空数据库首次更新的起始日")
+    daily.add_argument("--batch-size", type=int, default=100)
+    daily.add_argument("--workers", type=int, default=4, help="并发下载线程数，默认 4")
+    daily.add_argument("--no-snapshot", action="store_true", help="仅更新数据，不自动固化当天候选池")
+    daily.add_argument("--no-update", action="store_true", help="跳过数据更新，只用当前库内容推送（验证推送链路用）")
+    daily.add_argument("--dry-run", action="store_true", help="只把卡片内容打印到终端，不发送")
+    daily.add_argument("--top-n", type=int, default=10, help="推送的候选股数量，默认 10")
+    daily.add_argument("--lookback", type=int, default=20, help="动量计算窗口，默认 20 个交易日")
+    daily.add_argument("--min-history", type=int, default=250, help="至少具备的历史交易日数，默认 250")
+    daily.add_argument("--min-avg-amount", type=float, default=20_000_000, help="近 lookback 日平均成交额下限（元），默认 2000 万")
+    daily.add_argument("--max-lag-days", type=int, default=7, help="个股相对最新数据允许落后天数，默认 7")
+    daily.add_argument("--as-of", help="截止交易日，默认最近完整覆盖日")
+    notify = sub.add_parser("notify", help="只推送一张飞书卡片，不更新任何数据；用于验证配置")
+    notify.add_argument("--test", action="store_true", help="发送配置自检卡片（不读数据库，可单独验证飞书链路）")
+    notify.add_argument("--webhook", help=f"飞书机器人 Webhook 地址，默认读环境变量 {WEBHOOK_ENV}")
+    notify.add_argument("--secret", help=f"飞书机器人签名密钥，默认读环境变量 {SECRET_ENV}")
+    notify.add_argument("--dry-run", action="store_true", help="只把卡片内容打印到终端，不发送")
+    notify.add_argument("--top-n", type=int, default=10)
+    notify.add_argument("--lookback", type=int, default=20)
+    notify.add_argument("--min-history", type=int, default=250)
+    notify.add_argument("--min-avg-amount", type=float, default=20_000_000)
+    notify.add_argument("--max-lag-days", type=int, default=7)
+    notify.add_argument("--as-of")
     return app
 
 
@@ -816,10 +1008,10 @@ def main() -> None:
             end = date.fromisoformat(args.end)
             if start > end:
                 raise ValueError("--start 不能晚于 --end")
-        if args.command == "update":
+        if args.command in ("update", "daily"):
             if date.fromisoformat(args.bootstrap_start) > date.fromisoformat(args.end):
                 raise ValueError("--bootstrap-start 不能晚于 --end")
-        {"init": run_init, "update": run_update, "list": run_list, "status": run_status, "audit": run_audit, "backtest": run_backtest, "rotation": run_rotation, "validate": run_validate, "compare": run_compare, "candidates": run_candidates, "snapshot-status": run_snapshot_status, "paper-init": run_paper_init, "paper-status": run_paper_status, "paper-mark": run_paper_mark, "check": run_check}[args.command](args)
+        {"init": run_init, "update": run_update, "list": run_list, "status": run_status, "audit": run_audit, "backtest": run_backtest, "rotation": run_rotation, "validate": run_validate, "compare": run_compare, "candidates": run_candidates, "snapshot-status": run_snapshot_status, "paper-init": run_paper_init, "paper-status": run_paper_status, "paper-mark": run_paper_mark, "check": run_check, "daily": run_daily, "notify": run_notify}[args.command](args)
     except Exception as error:
         LOG.error("%s", error)
         raise SystemExit(1) from error

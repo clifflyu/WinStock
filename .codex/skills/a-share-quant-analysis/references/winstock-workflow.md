@@ -11,7 +11,11 @@ python -m winstocker audit
 
 `audit` reports SQLite integrity, active securities, symbols with bars, total rows, the latest **complete coverage** day, newest observed day, symbols with no bars (split into fetch failures vs not-yet-listed), lagging symbols (split into suspended vs genuinely stale), suspended symbols, forward-adjustment self-consistency, and pending download failures. Not-yet-listed and suspended symbols are normal market states and do not fail the audit; only real fetch failures, non-suspension lag, and scale drift do. Do not interpret broad cross-sectional results when it says `需检查`.
 
-The systemd timer ordinarily runs daily at 19:30 Asia/Shanghai. `update` re-fetches from **each stock's own last stored day** (not one global date, which would leave holes for stocks that missed days), so it corrects source changes without downloading the full date range again. It still queries roughly 5,200 stocks. Before fetching it runs a network-free forward-adjustment self-check and refetches any drifted stock from its own first trading day. A successful update saves a dated candidate snapshot only when there are zero download failures, then rebuilds the trading calendar and runs `audit`.
+The systemd timer ordinarily runs daily at 19:30 Asia/Shanghai. It invokes a single `daily` command that chains update → audit → candidates → Feishu push. `update` re-fetches from **each stock's own last stored day** (not one global date, which would leave holes for stocks that missed days), so it corrects source changes without downloading the full date range again. It still queries roughly 5,200 stocks. Before fetching it runs a network-free forward-adjustment self-check and refetches any drifted stock from its own first trading day. A successful update saves a dated candidate snapshot only when there are zero download failures, then rebuilds the trading calendar and runs `audit`.
+
+`daily` reports every step's failure surface rather than aborting on the first error: **the Feishu card is sent even when the update fails**, because silence is indistinguishable from "nothing happened today". The full audit verdict goes to the journal as well as the card. Exit codes: `0` all good, `1` update failed but the red card was delivered, `2` data fine but the card failed to send, `3` both failed. `--no-update` skips fetching and pushes from the existing database. `--dry-run` prints the card without sending and needs no credentials.
+
+Because a red or orange card is itself the alarm, `daily` never raises before attempting delivery — a failure to open the database degrades to a red card carrying the reason, not a traceback.
 
 ## Candidate review
 
@@ -23,6 +27,18 @@ python -m winstocker snapshot-status
 Default candidates use the latest complete coverage day, at least 250 history days, at least 20 million yuan average turnover over the 20-day lookback, a contiguous momentum window against the trading calendar, and a name-based ST exclusion. The contiguity check is real, not nominal: without it a suspension inside the window makes the "20-day momentum" span 25+ market days. The JSON contains `symbol`, `name`, `as_of`, `momentum`, `average_amount`, and `history_days`.
 
 Snapshots preserve the pool known on each date. Prefer accumulating and using them for future universe research instead of applying the current list of listed companies backward in time.
+
+The daily Feishu card's Top 10 uses exactly the same parameters as `save_default_candidate_snapshot` (top_n=10, lookback=20, min_history=250, min_avg_amount=2e7), so what the card shows matches what was archived for that date. Overriding `daily --top-n` changes only the card, never the snapshot — this keeps the archived research universe from drifting with presentation settings.
+
+## Push-chain self-check
+
+```bash
+python -m winstocker notify --test        # 配置自检卡片，秒级，不读数据库
+python -m winstocker notify               # 用当前库内容发一张真实播报卡片
+python -m winstocker daily --no-update --dry-run   # 只打印卡片 JSON，不发送
+```
+
+The webhook resolves from `--webhook` first, then `WINSTOCK_FEISHU_WEBHOOK`; the signing secret from `--secret`, then `WINSTOCK_FEISHU_SECRET`. Deployment lives in `deploy/飞书推送部署指南.md`; the credential file is `/etc/winstock/notify.env` (0600, outside the repository) because the systemd units install world-readable.
 
 ## Strategy research
 
