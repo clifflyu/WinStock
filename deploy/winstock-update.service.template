@@ -1,0 +1,15 @@
+[Unit]
+Description=WinStock daily data update, candidate snapshot, and audit
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=__WINSTOCK_USER__
+WorkingDirectory=__WINSTOCK_DIR__
+Environment="PYTHONUNBUFFERED=1"
+Environment="WINSTOCK_PYTHON=__WINSTOCK_PYTHON__"
+Environment="WINSTOCK_DB=__WINSTOCK_DB__"
+Nice=10
+UMask=0077
+ExecStart=/bin/bash -lc 'set -euo pipefail; "$WINSTOCK_PYTHON" -m winstocker --db "$WINSTOCK_DB" update --workers 4; "$WINSTOCK_PYTHON" -m winstocker --db "$WINSTOCK_DB" audit'

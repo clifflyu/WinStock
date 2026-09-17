@@ -16,8 +16,13 @@ from urllib.request import Request, urlopen
 
 from .audit import audit_database
 from .backtest import Bar, dual_ma_backtest, load_bars, load_panel, momentum_rotation_backtest, walk_forward_rotation
+from .candidates import momentum_candidates
 from .evaluation import compare_buy_and_hold
+from .gate import evaluate_gate
+from .paper import account_status, create_account, mark_account
 from .reporting import write_backtest_report, write_comparison_report, write_walk_forward_report
+from .robustness import walk_forward_robustness
+from .snapshots import save_snapshot, snapshot_status
 
 LOG = logging.getLogger("winstocker")
 # 清单取自东方财富的延时行情主机：push2 与 push2his 会对海外和机房 IP 直接断连。
@@ -336,6 +341,11 @@ def incremental_start(conn: sqlite3.Connection, end: str, bootstrap_start: str) 
     return min(latest, end)
 
 
+def save_default_candidate_snapshot(conn: sqlite3.Connection) -> int:
+    picks = momentum_candidates(conn, top_n=10, lookback=20, min_history=250, min_avg_amount=20_000_000)
+    return save_snapshot(conn, "momentum-20-history-250-amount-2e+07-top-10", picks)
+
+
 def run_update(args: argparse.Namespace) -> None:
     conn = connect(args.db)
     try:
@@ -377,6 +387,10 @@ def run_update(args: argparse.Namespace) -> None:
                 conn.executemany("DELETE FROM download_failures WHERE symbol = ?", [(item["symbol"],) for item in group if item["symbol"] not in failed_symbols])
                 conn.executemany("INSERT INTO download_failures(symbol, error, failed_at) VALUES (?, ?, ?) ON CONFLICT(symbol) DO UPDATE SET error=excluded.error, failed_at=excluded.failed_at", errors)
             LOG.info("批次 %d：完成 %d/%d（成功 %d，失败 %d，写入 %d 条日 K）", number, min(number * args.batch_size, len(securities)), len(securities), successful, failed, len(rows_to_save))
+        if not failed and not args.no_snapshot:
+            LOG.info("已自动固化 %d 只候选股的历史快照。", save_default_candidate_snapshot(conn))
+        elif failed:
+            LOG.warning("本次有下载失败，跳过候选快照，避免固化不完整数据。")
         LOG.info("增量更新结束：成功 %d，失败 %d。请运行 `python -m winstocker audit`。", successful, failed)
     finally:
         conn.close()
@@ -544,6 +558,95 @@ def run_compare(args: argparse.Namespace) -> None:
         conn.close()
 
 
+def run_candidates(args: argparse.Namespace) -> None:
+    conn = connect(args.db)
+    try:
+        picks = momentum_candidates(conn, args.as_of, args.top_n, args.lookback, args.min_history, args.min_avg_amount)
+        if not picks:
+            print("没有满足当前质量门槛的候选股。")
+            return
+        print(f"候选池（{picks[0].as_of}，仅供研究与模拟）：")
+        for number, item in enumerate(picks, start=1):
+            print(f"{number:>2}. {item.symbol} {item.name} | {args.lookback} 日动量 {item.momentum:.2%} | 平均成交额 {item.average_amount / 1e8:.2f} 亿")
+        if args.save:
+            key = f"momentum-{args.lookback}-history-{args.min_history}-amount-{args.min_avg_amount:g}-top-{args.top_n}"
+            print(f"已固化候选快照：{save_snapshot(conn, key, picks)} 只（{key}）")
+        if args.output:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(json.dumps([item.__dict__ for item in picks], ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            print(f"候选池文件：{args.output}")
+    finally:
+        conn.close()
+
+
+def run_snapshot_status(args: argparse.Namespace) -> None:
+    conn = connect(args.db)
+    try:
+        days, rows, latest = snapshot_status(conn)
+        print(f"候选池历史快照：{days} 个交易日，{rows} 条记录，最新：{latest or '-'}")
+    finally:
+        conn.close()
+
+
+def print_paper_status(status: Any) -> None:
+    print(f"模拟账户：{status.account}\n估值日：{status.as_of}\n初始资金：{status.initial_cash:,.2f}\n现金：{status.cash:,.2f}\n持仓市值：{status.market_value:,.2f}\n总权益：{status.total_value:,.2f}\n持仓数：{status.positions}")
+
+
+def run_paper_init(args: argparse.Namespace) -> None:
+    conn = connect(args.db)
+    try:
+        create_account(conn, args.name, args.cash)
+        print(f"已创建本地模拟账户：{args.name}（{args.cash:,.2f}）。未连接券商，未产生任何订单。")
+    finally:
+        conn.close()
+
+
+def run_paper_status(args: argparse.Namespace) -> None:
+    conn = connect(args.db)
+    try:
+        print_paper_status(account_status(conn, args.name, args.as_of))
+    finally:
+        conn.close()
+
+
+def run_paper_mark(args: argparse.Namespace) -> None:
+    conn = connect(args.db)
+    try:
+        print_paper_status(mark_account(conn, args.name, args.as_of))
+        print("已写入本地模拟净值记录。")
+    finally:
+        conn.close()
+
+
+def run_check(args: argparse.Namespace) -> None:
+    symbols = tuple(item.strip() for item in args.symbols.split(",") if item.strip())
+    conn = connect(args.db)
+    try:
+        panel = load_panel(conn, symbols, args.start, args.end)
+        validation = walk_forward_rotation(panel, args.train_ratio, top_n=args.top_n, lookback=args.lookback,
+            rebalance_every=args.rebalance_every, initial_cash=args.cash, commission_rate=args.commission,
+            minimum_commission=args.min_commission, stamp_duty_rate=args.stamp_duty, slippage_bps=args.slippage_bps,
+            min_history=args.min_history, min_avg_amount=args.min_avg_amount)
+        full = momentum_rotation_backtest(panel, args.top_n, args.lookback, args.rebalance_every, args.cash,
+            args.commission, args.min_commission, args.stamp_duty, args.slippage_bps, args.min_history, args.min_avg_amount)
+        raw = fetch_kline_bars(index_code(args.benchmark), full.start, full.end, "qfq")
+        benchmark = compare_buy_and_hold(args.benchmark, [Bar(day, float(row[1]), float(row[2])) for day, row in raw.items() if len(row) > 2], full.start, full.end, full.total_return)
+        robustness = walk_forward_robustness(panel, max_drawdown=args.max_drawdown, min_trades=args.min_trades,
+            top_n=args.top_n, lookback=args.lookback, rebalance_every=args.rebalance_every, initial_cash=args.cash,
+            commission_rate=args.commission, minimum_commission=args.min_commission, stamp_duty_rate=args.stamp_duty,
+            slippage_bps=args.slippage_bps, min_history=args.min_history, min_avg_amount=args.min_avg_amount)
+        gate = evaluate_gate(audit_database(conn), validation, benchmark, args.max_drawdown, args.min_trades, robustness)
+        print(f"研究准入：{'允许模拟观察' if gate.passed else '拒绝'}")
+        for reason in gate.reasons:
+            print(f"- {reason}")
+        if args.output:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(json.dumps({"gate": gate.__dict__, "benchmark": benchmark.__dict__, "validation": {"split_day": validation.split_day, "train": validation.train.__dict__, "validation": validation.validation.__dict__}, "robustness": {"passed": robustness.passed, "reasons": robustness.reasons, "splits": [item.split_day for item in robustness.results]}}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            print(f"准入报告：{args.output}")
+    finally:
+        conn.close()
+
+
 def parser() -> argparse.ArgumentParser:
     app = argparse.ArgumentParser(description="WinStock A 股清单与日 K 初始化工具")
     app.add_argument("--db", type=Path, default=DEFAULT_DB, help="SQLite 数据库路径（默认 data/winstock.db）")
@@ -558,6 +661,7 @@ def parser() -> argparse.ArgumentParser:
     update.add_argument("--bootstrap-start", default="2024-01-01", help="空数据库首次更新的起始日")
     update.add_argument("--batch-size", type=int, default=100)
     update.add_argument("--workers", type=int, default=6)
+    update.add_argument("--no-snapshot", action="store_true", help="仅更新数据，不自动固化当天候选池")
     sub.add_parser("list", help="仅刷新 A 股清单")
     sub.add_parser("status", help="查看本地数据状态")
     audit = sub.add_parser("audit", help="审计数据完整性和覆盖率；回测前建议运行")
@@ -621,6 +725,43 @@ def parser() -> argparse.ArgumentParser:
     compare.add_argument("--min-history", type=int, default=250)
     compare.add_argument("--min-avg-amount", type=float, default=20_000_000)
     compare.add_argument("--output", type=Path, help="将策略与基准比较写入 JSON 报告")
+    candidates = sub.add_parser("candidates", help="生成通过基础质量门槛的日频研究候选池，不产生交易指令")
+    candidates.add_argument("--as-of", help="截止交易日，默认最近完整覆盖日")
+    candidates.add_argument("--top-n", type=int, default=10)
+    candidates.add_argument("--lookback", type=int, default=20)
+    candidates.add_argument("--min-history", type=int, default=250)
+    candidates.add_argument("--min-avg-amount", type=float, default=20_000_000)
+    candidates.add_argument("--output", type=Path, help="将候选池写入 JSON 文件")
+    candidates.add_argument("--save", action="store_true", help="将本次候选池固化为带日期的历史快照")
+    sub.add_parser("snapshot-status", help="查看已固化的候选池历史快照")
+    paper_init = sub.add_parser("paper-init", help="创建纯本地模拟账户；不连接券商")
+    paper_init.add_argument("--name", default="default")
+    paper_init.add_argument("--cash", type=float, default=100_000)
+    paper_status = sub.add_parser("paper-status", help="查看本地模拟账户估值")
+    paper_status.add_argument("--name", default="default")
+    paper_status.add_argument("--as-of")
+    paper_mark = sub.add_parser("paper-mark", help="写入本地模拟账户的当日净值")
+    paper_mark.add_argument("--name", default="default")
+    paper_mark.add_argument("--as-of")
+    check = sub.add_parser("check", help="自动检查策略是否仅可进入模拟观察；绝不输出实盘许可")
+    check.add_argument("--symbols", required=True, help="逗号分隔的股票池")
+    check.add_argument("--benchmark", default="000300")
+    check.add_argument("--start")
+    check.add_argument("--end")
+    check.add_argument("--train-ratio", type=float, default=0.7)
+    check.add_argument("--top-n", type=int, default=3)
+    check.add_argument("--lookback", type=int, default=20)
+    check.add_argument("--rebalance-every", type=int, default=20)
+    check.add_argument("--cash", type=float, default=100_000)
+    check.add_argument("--commission", type=float, default=0.0003)
+    check.add_argument("--min-commission", type=float, default=5)
+    check.add_argument("--stamp-duty", type=float, default=0.0005)
+    check.add_argument("--slippage-bps", type=float, default=5)
+    check.add_argument("--min-history", type=int, default=250)
+    check.add_argument("--min-avg-amount", type=float, default=20_000_000)
+    check.add_argument("--max-drawdown", type=float, default=-0.20, help="样本外最大回撤警戒线，默认 -0.20")
+    check.add_argument("--min-trades", type=int, default=10)
+    check.add_argument("--output", type=Path)
     return app
 
 
@@ -638,7 +779,7 @@ def main() -> None:
         if args.command == "update":
             if date.fromisoformat(args.bootstrap_start) > date.fromisoformat(args.end):
                 raise ValueError("--bootstrap-start 不能晚于 --end")
-        {"init": run_init, "update": run_update, "list": run_list, "status": run_status, "audit": run_audit, "backtest": run_backtest, "rotation": run_rotation, "validate": run_validate, "compare": run_compare}[args.command](args)
+        {"init": run_init, "update": run_update, "list": run_list, "status": run_status, "audit": run_audit, "backtest": run_backtest, "rotation": run_rotation, "validate": run_validate, "compare": run_compare, "candidates": run_candidates, "snapshot-status": run_snapshot_status, "paper-init": run_paper_init, "paper-status": run_paper_status, "paper-mark": run_paper_mark, "check": run_check}[args.command](args)
     except Exception as error:
         LOG.error("%s", error)
         raise SystemExit(1) from error

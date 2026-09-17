@@ -39,9 +39,22 @@ python -m winstocker validate --symbols 600000,000001,300750,600519 --output rep
 
 # 与沪深 300 买入持有比较，检查主动策略是否创造超额收益
 python -m winstocker compare --symbols 600000,000001,300750,600519 --benchmark 000300
+
+# 生成当天研究候选池；不会产生交易指令
+python -m winstocker candidates --top-n 10 --output reports/candidates.json
+
+# 将当天候选池保存为不可混入未来名单的历史快照
+python -m winstocker candidates --top-n 10 --save
+
+# 创建纯本地模拟账户（不连接券商），后续只记录模拟净值
+python -m winstocker paper-init --name research --cash 100000
+python -m winstocker paper-mark --name research
+
+# 自动汇总数据、样本外、回撤、成交样本与基准比较，只给出模拟观察或拒绝结论
+python -m winstocker check --symbols 600000,000001,300750,600519
 ```
 
-数据库路径可用 `--db /path/to/file.db` 指定。首次使用执行 `init`；此后每个交易日收盘后执行 `update`。`update` 会重抓最新已存交易日以修订可能的源端更正，再补齐新交易日，而非重下全量历史。证券和日 K 均以主键 UPSERT，失败的证券会记录在 `download_failures` 表中，下一次更新会重试。
+数据库路径可用 `--db /path/to/file.db` 指定。首次使用执行 `init`；此后每个交易日收盘后执行 `update`。`update` 会重抓最新已存交易日以修订可能的源端更正，再补齐新交易日，而非重下全量历史。若本次零下载失败，它还会自动固化当天候选池快照；使用 `--no-snapshot` 可关闭。证券和日 K 均以主键 UPSERT，失败的证券会记录在 `download_failures` 表中，下一次更新会重试。
 
 ## 数据范围与表
 
@@ -84,6 +97,10 @@ SELECT trade_date, close FROM daily_kline WHERE symbol = '600000' AND trade_date
 
 两个接口都存在访问频率限制；网络不稳时可降低 `--workers`，然后重新运行同一条 `init` 命令。
 
+## 服务器每日自动更新
+
+可使用 `deploy/` 中的 systemd 定时器，在每个工作日 16:40（Asia/Shanghai）自动执行数据更新、候选快照和审计。部署说明见 [deploy/README.md](deploy/README.md)。该服务只访问行情接口和本地 SQLite，不连接任何券商。
+
 运行回测前先执行 `audit`。若出现无日线证券、落后数据或待重试失败，先修复或排除相应标的；不要把缺失数据造成的回测结果当作策略优势。
 
 ## 日频研究回测
@@ -101,3 +118,13 @@ SELECT trade_date, close FROM daily_kline WHERE symbol = '600000' AND trade_date
 `validate` 会按时间顺序切分训练段与样本外验证段，两段独立建仓、独立回测。验证段不是未来预测，但它没有参与同一次结果评估，能更早暴露只适合历史行情的策略。验证段为负、交易样本太少或明显弱于训练段时，不应进入模拟交易。
 
 `compare` 默认以沪深 300（000300）价格指数的同期买入持有收益为基准，并输出策略超额收益。指数价格口径不含基金申赎成本与股息再投资，故只用作基础市场比较；未跑赢基准的策略不应作为主动交易候选。
+
+`candidates` 只使用最近完整覆盖交易日的数据，默认排除名称含 ST、历史不足 250 日、近 20 日平均成交额低于 2,000 万元以及日线不连续的股票，再按 20 日动量列出最多 10 个研究候选。候选池不是买卖推荐，必须继续经过回测、样本外验证和模拟交易。
+
+加上 `--save` 会把当天候选池与筛选参数固化在本地数据库。持续积累这些快照后，未来回测可只使用当时实际出现过的候选，避免把未来仍然上市的股票混进过去的研究。
+
+前瞻验证需要真实时间：即使今天开始每天都自动保存快照，也不能在一天内产生数月的独立样本。工具会持续积累此数据，但不会把历史回填伪装成前瞻结果。
+
+模拟账户只存于本地 SQLite，当前不会创建交易订单、更不会连接券商账户。只有策略通过 `check` 后，才会为它补充受控的模拟调仓能力。
+
+`check` 是自动研究准入门：它会同时检查 60/40、70/30、80/20 三个时间切分。只有所有样本外窗口为正、回撤不超过 20%、样本外成交至少 10 笔、且跑赢基准时，才会显示“允许模拟观察”。它永远不会输出实盘许可。
