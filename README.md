@@ -49,11 +49,10 @@ python3 -m winstocker daily
 ```
 
 Webhook 地址是凭据，配置写在**项目根目录的 `.env`**（已在 `.gitignore` 中，本仓库
-是公开的）：
+是公开的）。仓库里附带模板 `.env.example`：
 
-```
-WINSTOCK_FEISHU_WEBHOOK=https://open.feishu.cn/open-apis/bot/v2/hook/xxx
-WINSTOCK_FEISHU_SECRET=          # 仅当机器人开启签名校验时填写
+```bash
+cp .env.example .env && chmod 600 .env   # 然后把 Webhook 地址填进去
 ```
 
 读取优先级为**命令行参数 > 环境变量 > `.env`**，环境变量名为

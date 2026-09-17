@@ -170,6 +170,26 @@ class NotifyTests(unittest.TestCase):
         self.assertEqual(DOTENV_PATH, PROJECT_ROOT / ".env")
 
     @unittest.skipIf(shutil.which("git") is None, "需要 git")
+    def test_env_example_is_committable_and_holds_no_real_secret(self):
+        """模板必须能进版本库（否则克隆下来没有可复制的东西），且只能是占位符。
+
+        这两条互为前提：模板一旦被填进真实地址并提交，就等于把密钥公开了。
+        """
+        path = PROJECT_ROOT / ".env.example"
+        self.assertTrue(path.exists(), ".env.example 缺失，新部署者没有可复制的模板")
+        values = parse_dotenv(path.read_text(encoding="utf-8"))
+        for name in (WEBHOOK_ENV, SECRET_ENV):
+            self.assertIn(name, values, f"模板缺少 {name}")
+        self.assertIn("xxxx", values[WEBHOOK_ENV], "模板里应当是占位地址，不是真实地址")
+        self.assertEqual(values[SECRET_ENV], "", "模板里的密钥必须留空")
+
+        result = subprocess.run(["git", "-C", str(PROJECT_ROOT), "check-ignore", "-q", ".env.example"],
+                                capture_output=True, text=True)
+        if result.returncode not in (0, 1):
+            self.skipTest("当前目录不是 git 仓库")
+        self.assertEqual(result.returncode, 1, ".env.example 被忽略了，克隆下来会缺模板")
+
+    @unittest.skipIf(shutil.which("git") is None, "需要 git")
     def test_env_file_must_stay_gitignored(self):
         """本仓库是公开的：.env 一旦被提交，Webhook 就永久留在 git 历史里。
 

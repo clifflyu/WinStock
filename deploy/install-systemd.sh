@@ -44,12 +44,11 @@ notify_env="$project_dir/.env"
 if [[ ! -e "$notify_env" ]]; then
   # 只在首次创建，重复安装绝不覆盖已有的真实密钥。
   umask 077
-  cat > "$notify_env" <<'ENVEOF'
-# WinStock 飞书播报配置。此文件含密钥：本仓库是公开的，请勿提交、勿改为 644。
-# 值两侧可以加引号，也可以不加（由 Python 解析，不是 systemd 解析）。
-WINSTOCK_FEISHU_WEBHOOK=
-WINSTOCK_FEISHU_SECRET=
-ENVEOF
+  if [[ -f "$project_dir/.env.example" ]]; then
+    cp "$project_dir/.env.example" "$notify_env"
+  else
+    printf 'WINSTOCK_FEISHU_WEBHOOK=\nWINSTOCK_FEISHU_SECRET=\n' > "$notify_env"
+  fi
 fi
 
 # 允许在首次部署时一次性写入，省去手工编辑。

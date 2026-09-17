@@ -9,8 +9,8 @@
 sudo ./deploy/install-systemd.sh
 ```
 
-脚本会在**项目根目录**创建 `.env`（`0600`）存放飞书 Webhook，并检查它确实被
-`.gitignore` 忽略（本仓库公开，提交它等于公开凭据）。unit 文件以 0644 安装、
+脚本会在**项目根目录**创建 `.env`（`0600`，内容取自 `.env.example`）存放飞书
+Webhook，并检查它确实被 `.gitignore` 忽略（本仓库公开，提交它等于公开凭据）。unit 文件以 0644 安装、
 全局可读，所以密钥不能写进 unit 或 `ExecStart` 命令行（`ps` 也全局可见）；
 `.env` 由程序自行读取，不经 systemd。重复运行安装脚本**不会覆盖**已存在的
 `.env`；如需在首次部署时一并写入，可设 `WINSTOCK_FEISHU_WEBHOOK`。
