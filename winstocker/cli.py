@@ -14,6 +14,10 @@ from typing import Any, Iterable
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from .audit import audit_database
+from .backtest import dual_ma_backtest, load_bars, load_panel, momentum_rotation_backtest, walk_forward_rotation
+from .reporting import write_backtest_report, write_walk_forward_report
+
 LOG = logging.getLogger("winstocker")
 # 清单取自东方财富的延时行情主机：push2 与 push2his 会对海外和机房 IP 直接断连。
 LIST_URL = "https://push2delay.eastmoney.com/api/qt/clist/get"
@@ -323,6 +327,60 @@ def run_init(args: argparse.Namespace) -> None:
         conn.close()
 
 
+def incremental_start(conn: sqlite3.Connection, end: str, bootstrap_start: str) -> str:
+    """Re-fetch the latest stored day so corrections are UPSERTed, then append new days."""
+    latest = conn.execute("SELECT MAX(trade_date) FROM kline").fetchone()[0]
+    if not latest:
+        return bootstrap_start
+    return min(latest, end)
+
+
+def run_update(args: argparse.Namespace) -> None:
+    conn = connect(args.db)
+    try:
+        LOG.info("正在刷新 A 股清单…")
+        securities = fetch_securities()
+        if not securities:
+            raise RuntimeError("A 股清单为空，终止更新。")
+        save_securities(conn, securities)
+        start = incremental_start(conn, args.end, args.bootstrap_start)
+        if date.fromisoformat(start) > date.fromisoformat(args.end):
+            raise ValueError("数据库最新日期晚于 --end；请指定更晚的 --end")
+        ids = security_ids(conn)
+        LOG.info("增量更新 %s 至 %s，共 %d 只 A 股。", start, args.end, len(securities))
+        successful, failed = 0, 0
+        for number, group in enumerate(batches(securities, args.batch_size), start=1):
+            rows_to_save: list[tuple[Any, ...]] = []
+            errors: list[tuple[str, str, str]] = []
+            with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
+                futures = {pool.submit(fetch_kline, item, start, args.end): item for item in group}
+                for future in concurrent.futures.as_completed(futures):
+                    security = futures[future]
+                    try:
+                        _, rows = future.result()
+                        rows_to_save.extend(rows)
+                        successful += 1
+                    except Exception as error:
+                        failed += 1
+                        errors.append((security["symbol"], str(error)[:1000], datetime.now().isoformat(timespec="seconds")))
+                        LOG.warning("%s %s：更新失败（%s）", security["symbol"], security["name"], errors[-1][1])
+            with conn:
+                conn.executemany(
+                    f"""INSERT INTO kline(symbol_id, trade_date, {", ".join(KLINE_COLUMNS)})
+                       VALUES ({", ".join("?" * (len(KLINE_COLUMNS) + 2))})
+                       ON CONFLICT(symbol_id, trade_date) DO UPDATE SET
+                       {", ".join(f"{name}=excluded.{name}" for name in KLINE_COLUMNS)}""",
+                    [(ids[row[0]], *row[1:]) for row in rows_to_save],
+                )
+                failed_symbols = {error[0] for error in errors}
+                conn.executemany("DELETE FROM download_failures WHERE symbol = ?", [(item["symbol"],) for item in group if item["symbol"] not in failed_symbols])
+                conn.executemany("INSERT INTO download_failures(symbol, error, failed_at) VALUES (?, ?, ?) ON CONFLICT(symbol) DO UPDATE SET error=excluded.error, failed_at=excluded.failed_at", errors)
+            LOG.info("批次 %d：完成 %d/%d（成功 %d，失败 %d，写入 %d 条日 K）", number, min(number * args.batch_size, len(securities)), len(securities), successful, failed, len(rows_to_save))
+        LOG.info("增量更新结束：成功 %d，失败 %d。请运行 `python -m winstocker audit`。", successful, failed)
+    finally:
+        conn.close()
+
+
 def run_list(args: argparse.Namespace) -> None:
     conn = connect(args.db)
     try:
@@ -344,6 +402,107 @@ def run_status(args: argparse.Namespace) -> None:
         conn.close()
 
 
+def run_audit(args: argparse.Namespace) -> None:
+    conn = connect(args.db)
+    try:
+        report = audit_database(conn, args.max_lag_days)
+        verdict = "通过" if report.ok else "需检查（不要直接相信回测结果）"
+        print(
+            f"数据审计：{verdict}\n数据库完整性：{report.integrity}\n"
+            f"活跃证券：{report.active_securities}\n有日线证券：{report.symbols_with_bars}\n"
+            f"日线总数：{report.rows}\n完整覆盖截至：{report.latest_day or '-'}（{report.latest_day_symbols} 只）\n"
+            f"最新观测日：{report.newest_observed_day or '-'}（{report.newest_observed_symbols} 只）\n"
+            f"无日线证券：{report.no_data_symbols}\n"
+            f"落后最新日超过 {args.max_lag_days} 天：{report.lagging_symbols} 只\n"
+            f"下载失败待重试：{report.failures}"
+        )
+    finally:
+        conn.close()
+
+
+def run_backtest(args: argparse.Namespace) -> None:
+    conn = connect(args.db)
+    try:
+        bars = load_bars(conn, args.symbol, args.start, args.end)
+        result = dual_ma_backtest(
+            bars, args.symbol, args.fast, args.slow, args.cash, args.commission,
+            args.min_commission, args.stamp_duty, args.slippage_bps,
+        )
+        annualized = "-" if result.annualized_return is None else f"{result.annualized_return:.2%}"
+        print(
+            f"策略：双均线（{args.fast}/{args.slow}），{result.symbol}\n"
+            f"区间：{result.start} 至 {result.end}\n"
+            f"初始资金：{result.initial_cash:,.2f}\n最终权益：{result.final_value:,.2f}\n"
+            f"总收益：{result.total_return:.2%}\n年化收益：{annualized}\n"
+            f"最大回撤：{result.max_drawdown:.2%}\n成交笔数：{result.trades}\n"
+            f"涨停未买入：{result.blocked_buys}\n跌停未卖出：{result.blocked_sells}"
+        )
+        if args.output:
+            path = write_backtest_report(args.output, "dual_ma", {
+                "symbol": args.symbol, "fast": args.fast, "slow": args.slow, "cash": args.cash,
+                "commission": args.commission, "min_commission": args.min_commission,
+                "stamp_duty": args.stamp_duty, "slippage_bps": args.slippage_bps,
+            }, result)
+            print(f"研究报告：{path}")
+    finally:
+        conn.close()
+
+
+def run_rotation(args: argparse.Namespace) -> None:
+    symbols = tuple(item.strip() for item in args.symbols.split(",") if item.strip())
+    conn = connect(args.db)
+    try:
+        result = momentum_rotation_backtest(
+            load_panel(conn, symbols, args.start, args.end), args.top_n, args.lookback, args.rebalance_every,
+            args.cash, args.commission, args.min_commission, args.stamp_duty, args.slippage_bps,
+        )
+        annualized = "-" if result.annualized_return is None else f"{result.annualized_return:.2%}"
+        print(
+            f"策略：{args.lookback} 日动量前 {args.top_n}，每 {args.rebalance_every} 日调仓\n"
+            f"股票池：{','.join(result.symbols)}\n区间：{result.start} 至 {result.end}\n"
+            f"初始资金：{result.initial_cash:,.2f}\n最终权益：{result.final_value:,.2f}\n"
+            f"总收益：{result.total_return:.2%}\n年化收益：{annualized}\n最大回撤：{result.max_drawdown:.2%}\n"
+            f"调仓次数：{result.rebalances}\n成交笔数：{result.trades}\n"
+            f"涨停未买入：{result.blocked_buys}\n跌停未卖出：{result.blocked_sells}"
+        )
+        if args.output:
+            path = write_backtest_report(args.output, "momentum_rotation", {
+                "symbols": symbols, "top_n": args.top_n, "lookback": args.lookback,
+                "rebalance_every": args.rebalance_every, "cash": args.cash, "commission": args.commission,
+                "min_commission": args.min_commission, "stamp_duty": args.stamp_duty,
+                "slippage_bps": args.slippage_bps,
+            }, result)
+            print(f"研究报告：{path}")
+    finally:
+        conn.close()
+
+
+def run_validate(args: argparse.Namespace) -> None:
+    symbols = tuple(item.strip() for item in args.symbols.split(",") if item.strip())
+    conn = connect(args.db)
+    try:
+        result = walk_forward_rotation(
+            load_panel(conn, symbols, args.start, args.end), args.train_ratio, top_n=args.top_n,
+            lookback=args.lookback, rebalance_every=args.rebalance_every, initial_cash=args.cash,
+            commission_rate=args.commission, minimum_commission=args.min_commission,
+            stamp_duty_rate=args.stamp_duty, slippage_bps=args.slippage_bps,
+        )
+        def summary(label: str, item: Any) -> str:
+            annualized = "-" if item.annualized_return is None else f"{item.annualized_return:.2%}"
+            return f"{label}（{item.start} 至 {item.end}）：收益 {item.total_return:.2%}，年化 {annualized}，回撤 {item.max_drawdown:.2%}，成交 {item.trades} 笔"
+        print(f"样本外验证切分日：{result.split_day}\n{summary('训练段', result.train)}\n{summary('验证段', result.validation)}")
+        if args.output:
+            path = write_walk_forward_report(args.output, {
+                "symbols": symbols, "train_ratio": args.train_ratio, "top_n": args.top_n,
+                "lookback": args.lookback, "rebalance_every": args.rebalance_every, "cash": args.cash,
+                "commission": args.commission, "min_commission": args.min_commission,
+                "stamp_duty": args.stamp_duty, "slippage_bps": args.slippage_bps,
+            }, result)
+            print(f"研究报告：{path}")
+    finally:
+        conn.close()
+
+
 def parser() -> argparse.ArgumentParser:
     app = argparse.ArgumentParser(description="WinStock A 股清单与日 K 初始化工具")
     app.add_argument("--db", type=Path, default=DEFAULT_DB, help="SQLite 数据库路径（默认 data/winstock.db）")
@@ -353,8 +512,54 @@ def parser() -> argparse.ArgumentParser:
     init.add_argument("--end", default=date.today().isoformat())
     init.add_argument("--batch-size", type=int, default=100)
     init.add_argument("--workers", type=int, default=6)
+    update = sub.add_parser("update", help="增量刷新日 K（重抓最后一天并补齐新交易日）")
+    update.add_argument("--end", default=date.today().isoformat())
+    update.add_argument("--bootstrap-start", default="2024-01-01", help="空数据库首次更新的起始日")
+    update.add_argument("--batch-size", type=int, default=100)
+    update.add_argument("--workers", type=int, default=6)
     sub.add_parser("list", help="仅刷新 A 股清单")
     sub.add_parser("status", help="查看本地数据状态")
+    audit = sub.add_parser("audit", help="审计数据完整性和覆盖率；回测前建议运行")
+    audit.add_argument("--max-lag-days", type=int, default=7, help="个股相对最新数据允许落后天数，默认 7")
+    backtest = sub.add_parser("backtest", help="运行日频双均线研究回测（昨日收盘信号、今日开盘成交）")
+    backtest.add_argument("symbol", help="A 股代码，例如 600000")
+    backtest.add_argument("--start", help="回测起始日，默认使用全量数据")
+    backtest.add_argument("--end", help="回测结束日，默认使用全量数据")
+    backtest.add_argument("--fast", type=int, default=20, help="快均线窗口，默认 20")
+    backtest.add_argument("--slow", type=int, default=60, help="慢均线窗口，默认 60")
+    backtest.add_argument("--cash", type=float, default=100_000, help="初始资金，默认 100000")
+    backtest.add_argument("--commission", type=float, default=0.0003, help="佣金费率，默认万三")
+    backtest.add_argument("--min-commission", type=float, default=5, help="单笔最低佣金，默认 5 元")
+    backtest.add_argument("--stamp-duty", type=float, default=0.0005, help="卖出印花税率，默认万五")
+    backtest.add_argument("--slippage-bps", type=float, default=5, help="单边滑点（bp），默认 5")
+    backtest.add_argument("--output", type=Path, help="将可复现的 JSON 研究报告写入此路径")
+    rotation = sub.add_parser("rotation", help="运行指定股票池的日频动量轮动回测")
+    rotation.add_argument("--symbols", required=True, help="逗号分隔的股票池，例如 600000,000001,300750")
+    rotation.add_argument("--start", help="回测起始日，默认使用全量数据")
+    rotation.add_argument("--end", help="回测结束日，默认使用全量数据")
+    rotation.add_argument("--top-n", type=int, default=3, help="持有动量最高的股票数量，默认 3")
+    rotation.add_argument("--lookback", type=int, default=20, help="动量计算窗口，默认 20 日")
+    rotation.add_argument("--rebalance-every", type=int, default=20, help="调仓间隔，默认 20 日")
+    rotation.add_argument("--cash", type=float, default=100_000, help="初始资金，默认 100000")
+    rotation.add_argument("--commission", type=float, default=0.0003, help="佣金费率，默认万三")
+    rotation.add_argument("--min-commission", type=float, default=5, help="单笔最低佣金，默认 5 元")
+    rotation.add_argument("--stamp-duty", type=float, default=0.0005, help="卖出印花税率，默认万五")
+    rotation.add_argument("--slippage-bps", type=float, default=5, help="单边滑点（bp），默认 5")
+    rotation.add_argument("--output", type=Path, help="将可复现的 JSON 研究报告写入此路径")
+    validate = sub.add_parser("validate", help="动量轮动的训练/样本外验证，防止只看历史拟合")
+    validate.add_argument("--symbols", required=True, help="逗号分隔的股票池，例如 600000,000001,300750")
+    validate.add_argument("--start", help="回测起始日，默认使用全量数据")
+    validate.add_argument("--end", help="回测结束日，默认使用全量数据")
+    validate.add_argument("--train-ratio", type=float, default=0.7, help="训练段比例，默认 0.7")
+    validate.add_argument("--top-n", type=int, default=3)
+    validate.add_argument("--lookback", type=int, default=20)
+    validate.add_argument("--rebalance-every", type=int, default=20)
+    validate.add_argument("--cash", type=float, default=100_000)
+    validate.add_argument("--commission", type=float, default=0.0003)
+    validate.add_argument("--min-commission", type=float, default=5)
+    validate.add_argument("--stamp-duty", type=float, default=0.0005)
+    validate.add_argument("--slippage-bps", type=float, default=5)
+    validate.add_argument("--output", type=Path, help="将训练/验证结果写入 JSON 报告")
     return app
 
 
@@ -369,7 +574,10 @@ def main() -> None:
             end = date.fromisoformat(args.end)
             if start > end:
                 raise ValueError("--start 不能晚于 --end")
-        {"init": run_init, "list": run_list, "status": run_status}[args.command](args)
+        if args.command == "update":
+            if date.fromisoformat(args.bootstrap_start) > date.fromisoformat(args.end):
+                raise ValueError("--bootstrap-start 不能晚于 --end")
+        {"init": run_init, "update": run_update, "list": run_list, "status": run_status, "audit": run_audit, "backtest": run_backtest, "rotation": run_rotation, "validate": run_validate}[args.command](args)
     except Exception as error:
         LOG.error("%s", error)
         raise SystemExit(1) from error
