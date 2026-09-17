@@ -35,7 +35,9 @@ python3 -m winstocker --db /path/to/winstock.db audit
 ## 每日飞书播报
 
 定时任务每天北京时间 19:30 自动执行 `daily`：更新日 K → 审计数据 → 生成候选池 →
-推送一张飞书卡片到群里。正常情况下你不需要执行任何命令，看飞书即可。
+对上一交易日固化的候选池运行一次动量轮动回测 → 推送一张飞书卡片到群里。
+正常情况下你不需要执行任何命令，看飞书即可。回测报告保存在
+`reports/daily/previous-candidates-数据日期.json`；若尚未积累上一日快照，卡片会明确提示暂不可用。
 
 ```bash
 # 只发一条配置自检卡片，验证飞书链路（秒级，不碰数据）
@@ -47,6 +49,17 @@ python3 -m winstocker daily --no-update --dry-run
 # 完整跑一次（含数据更新）
 python3 -m winstocker daily
 ```
+
+创建一个1万元、按上一交易日候选快照自动模拟调仓的本地账户：
+
+```bash
+python3 -m winstocker paper-auto-init --name momentum-10k --cash 10000
+python3 -m winstocker paper-status --name momentum-10k
+```
+
+启用后，正常的 `daily` 会在数据审计通过时自动处理该账户：候选池动量前3、每20个
+交易日调仓，模拟佣金、印花税、滑点、涨跌停和停牌。重复执行同一数据日不会重复成交；
+`--dry-run` 永远不会修改模拟账户。该功能只写本地 SQLite，不连接券商或产生真实订单。
 
 Webhook 地址是凭据，配置写在**项目根目录的 `.env`**（已在 `.gitignore` 中，本仓库
 是公开的）。仓库里附带模板 `.env.example`：

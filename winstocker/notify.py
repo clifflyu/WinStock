@@ -17,6 +17,8 @@ from urllib.request import Request, urlopen
 
 from .audit import DataAudit
 from .candidates import Candidate
+from .backtest import RotationResult
+from .paper import PaperRebalance
 
 LOG = logging.getLogger("winstocker")
 
@@ -49,6 +51,13 @@ class NotifyTarget:
 
 
 @dataclass(frozen=True)
+class PreviousPoolBacktest:
+    snapshot_date: str
+    report_path: str
+    result: RotationResult
+
+
+@dataclass(frozen=True)
 class DailyDigest:
     """一天播报所需的全部素材。构造它不读数据库也不联网，因此可以直接测。"""
     generated_at: datetime
@@ -62,6 +71,10 @@ class DailyDigest:
     min_avg_amount: float
     snapshot_latest: str | None = None
     rows_added: int | None = None
+    previous_pool_backtest: PreviousPoolBacktest | None = None
+    backtest_error: str | None = None
+    paper_updates: tuple[PaperRebalance, ...] = ()
+    paper_error: str | None = None
 
     @property
     def status(self) -> str:
@@ -212,6 +225,51 @@ def _candidate_block(digest: DailyDigest) -> str:
     return "\n".join(lines)
 
 
+def _backtest_block(digest: DailyDigest) -> str:
+    item = digest.previous_pool_backtest
+    if item is None:
+        reason = digest.backtest_error or "尚无早于本次数据日的候选快照"
+        return f"**上一日候选池回测：暂不可用**\n{reason}。"
+    result = item.result
+    annualized = "-" if result.annualized_return is None else f"{result.annualized_return:.2%}"
+    return (
+        f"**上一日候选池回测**（快照 {item.snapshot_date}，{len(result.symbols)} 只）\n"
+        f"20 日动量前 3 · 每 20 日调仓 · 区间 {result.start} 至 {result.end}\n"
+        f"总收益 **{result.total_return:+.2%}** · 年化 {annualized} · 最大回撤 "
+        f"**{result.max_drawdown:.2%}** · 成交 {result.trades} 笔\n"
+        f"涨停未买 {result.blocked_buys} · 跌停未卖 {result.blocked_sells} · "
+        f"持仓停牌 {result.suspension_days} 天\n"
+        "这是按上一日名单做的回顾性诊断，不是样本外收益证明。"
+    )
+
+
+def _paper_block(digest: DailyDigest) -> str:
+    if digest.paper_error:
+        return f"**自动模拟交易：异常**\n{digest.paper_error}"
+    if not digest.paper_updates:
+        return "**自动模拟交易：未执行**\n没有启用的模拟策略账户，或本次为只读预览。"
+    sections: list[str] = []
+    for update in digest.paper_updates:
+        status = update.status
+        pnl = status.total_value / status.initial_cash - 1
+        lines = [
+            f"**模拟账户 {update.account}** · {update.trade_date}",
+            update.note,
+            f"总权益 **{status.total_value:,.2f}** · 累计收益 **{pnl:+.2%}** · "
+            f"现金 {status.cash:,.2f} · 持仓 {status.positions} 只",
+        ]
+        for fill in update.fills:
+            side = "买入" if fill.side == "BUY" else "卖出"
+            lines.append(
+                f"- {side} **{fill.symbol}** {fill.shares} 股 @ {fill.price:.3f}"
+                f"（费税 {fill.fee + fill.tax:.2f}）"
+            )
+        if not update.fills:
+            lines.append("- 今日无成交")
+        sections.append("\n".join(lines))
+    return "\n\n".join(sections)
+
+
 def build_card(digest: DailyDigest) -> dict[str, Any]:
     """构造 interactive 卡片（v1 结构：elements 在顶层）。
 
@@ -228,6 +286,10 @@ def build_card(digest: DailyDigest) -> dict[str, Any]:
     elements.append({"tag": "div", "text": {"tag": "lark_md", "content": _health_block(digest)}})
     elements.append({"tag": "hr"})
     elements.append({"tag": "div", "text": {"tag": "lark_md", "content": _candidate_block(digest)}})
+    elements.append({"tag": "hr"})
+    elements.append({"tag": "div", "text": {"tag": "lark_md", "content": _backtest_block(digest)}})
+    elements.append({"tag": "hr"})
+    elements.append({"tag": "div", "text": {"tag": "lark_md", "content": _paper_block(digest)}})
     elements.append({"tag": "hr"})
     footer = f"生成于 {digest.generated_at:%Y-%m-%d %H:%M:%S}"
     if digest.snapshot_latest:

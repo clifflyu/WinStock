@@ -8,7 +8,7 @@ import math
 import sqlite3
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -21,12 +21,13 @@ from .calendar import ensure_calendar, refresh_calendar, trading_days_between
 from .candidates import Candidate, momentum_candidates
 from .evaluation import compare_buy_and_hold
 from .gate import evaluate_gate
-from .notify import (ERROR_MAX_CHARS, SECRET_ENV, WEBHOOK_ENV, DailyDigest, NotifyTarget,
+from .notify import (ERROR_MAX_CHARS, SECRET_ENV, WEBHOOK_ENV, DailyDigest, NotifyTarget, PreviousPoolBacktest,
                      build_card, build_test_card, credential, require_credential, send_card)
-from .paper import account_status, create_account, mark_account
+from .paper import (account_status, create_account, enable_auto_strategy, mark_account,
+                    rebalance_account, run_enabled_strategies)
 from .reporting import write_backtest_report, write_comparison_report, write_walk_forward_report
 from .robustness import walk_forward_robustness
-from .snapshots import save_snapshot, snapshot_status
+from .snapshots import DEFAULT_STRATEGY_KEY, previous_snapshot, save_snapshot, snapshot_status
 
 LOG = logging.getLogger("winstocker")
 # 清单取自东方财富的延时行情主机：push2 与 push2his 会对海外和机房 IP 直接断连。
@@ -367,7 +368,7 @@ def symbol_starts(conn: sqlite3.Connection, end: str, bootstrap_start: str, repa
 
 def save_default_candidate_snapshot(conn: sqlite3.Connection) -> int:
     picks = momentum_candidates(conn, top_n=10, lookback=20, min_history=250, min_avg_amount=20_000_000)
-    return save_snapshot(conn, "momentum-20-history-250-amount-2e+07-top-10", picks)
+    return save_snapshot(conn, DEFAULT_STRATEGY_KEY, picks)
 
 
 def run_update(args: argparse.Namespace) -> None:
@@ -670,6 +671,30 @@ def run_paper_mark(args: argparse.Namespace) -> None:
         conn.close()
 
 
+def run_paper_auto_init(args: argparse.Namespace) -> None:
+    conn = connect(args.db)
+    try:
+        create_account(conn, args.name, args.cash)
+        enable_auto_strategy(conn, args.name, top_n=args.top_n, rebalance_every=args.rebalance_every)
+        print(f"已创建自动模拟账户：{args.name}（{args.cash:,.2f} 元），持有前 {args.top_n}，"
+              f"每 {args.rebalance_every} 个交易日调仓。仅本地记账，不连接券商。")
+    finally:
+        conn.close()
+
+
+def run_paper_rebalance(args: argparse.Namespace) -> None:
+    conn = connect(args.db)
+    try:
+        trade_date = args.as_of or audit_database(conn).latest_day
+        if not trade_date:
+            raise ValueError("没有完整覆盖交易日，无法模拟调仓")
+        result = rebalance_account(conn, args.name, trade_date)
+        print(f"模拟调仓：{result.note}")
+        print_paper_status(result.status)
+    finally:
+        conn.close()
+
+
 def run_check(args: argparse.Namespace) -> None:
     symbols = tuple(item.strip() for item in args.symbols.split(",") if item.strip())
     conn = connect(args.db)
@@ -753,6 +778,34 @@ def build_digest(conn: sqlite3.Connection, options: DigestOptions, update_error:
                        rows_added=rows_added)
 
 
+def run_previous_pool_backtest(conn: sqlite3.Connection, data_date: str,
+                               report_dir: Path = Path("reports/daily")) -> PreviousPoolBacktest:
+    """对上一交易日固化的候选池运行一次标准动量轮动回测并保存报告。"""
+    snapshot_date, symbols = previous_snapshot(conn, data_date)
+    if not snapshot_date or not symbols:
+        raise ValueError("尚无早于本次数据日的候选快照")
+    result = momentum_rotation_backtest(
+        load_panel(conn, symbols, None, data_date),
+        top_n=min(3, len(symbols)), lookback=20, rebalance_every=20,
+        initial_cash=100_000, commission_rate=0.0003, minimum_commission=5,
+        stamp_duty_rate=0.0005, slippage_bps=5,
+        min_history=250, min_avg_amount=20_000_000,
+    )
+    path = write_backtest_report(
+        report_dir / f"previous-candidates-{data_date}.json",
+        "previous_candidate_pool_momentum_rotation",
+        {
+            "snapshot_date": snapshot_date, "symbols": symbols, "top_n": min(3, len(symbols)),
+            "lookback": 20, "rebalance_every": 20, "cash": 100_000,
+            "commission": 0.0003, "min_commission": 5, "stamp_duty": 0.0005,
+            "slippage_bps": 5, "min_history": 250, "min_avg_amount": 20_000_000,
+            "end": data_date,
+        },
+        result,
+    )
+    return PreviousPoolBacktest(snapshot_date, str(path), result)
+
+
 def degraded_digest(options: DigestOptions, update_error: str | None, data_error: str,
                     generated_at: datetime) -> DailyDigest:
     """连数据库都打不开时的摘要——仍然要发得出去。"""
@@ -807,6 +860,35 @@ def run_daily(args: argparse.Namespace) -> None:
     try:
         conn = connect(args.db)
         digest = build_digest(conn, options, update_error, rows_added, now)
+        if digest.data_date and digest.audit and digest.audit.ok:
+            try:
+                automatic_backtest = run_previous_pool_backtest(conn, digest.data_date)
+                digest = replace(digest, previous_pool_backtest=automatic_backtest)
+                LOG.info("上一日候选池回测完成：快照 %s，收益 %.2f%%，回撤 %.2f%%，报告 %s",
+                         automatic_backtest.snapshot_date,
+                         automatic_backtest.result.total_return * 100,
+                         automatic_backtest.result.max_drawdown * 100,
+                         automatic_backtest.report_path)
+            except Exception as error:
+                backtest_error = str(error)[:ERROR_MAX_CHARS]
+                digest = replace(digest, backtest_error=backtest_error)
+                LOG.warning("上一日候选池回测暂不可用：%s", backtest_error)
+            if not args.dry_run:
+                try:
+                    paper_updates = run_enabled_strategies(conn, digest.data_date)
+                    digest = replace(digest, paper_updates=paper_updates)
+                    for paper_result in paper_updates:
+                        LOG.info("自动模拟账户 %s：%s；权益 %.2f，现金 %.2f，持仓 %d",
+                                 paper_result.account, paper_result.note,
+                                 paper_result.status.total_value, paper_result.status.cash,
+                                 paper_result.status.positions)
+                except Exception as error:
+                    # 模拟账户是附加研究功能，失败不能让数据健康与候选池播报一起降级。
+                    paper_error = str(error)[:ERROR_MAX_CHARS]
+                    digest = replace(digest, paper_error=paper_error)
+                    LOG.error("自动模拟调仓失败：%s", paper_error)
+        elif digest.data_date:
+            digest = replace(digest, backtest_error="数据审计未通过，为避免输出不可信结果已跳过")
     except Exception as error:
         LOG.error("打开数据库失败：%s", error)
         digest = degraded_digest(options, update_error, str(error)[:ERROR_MAX_CHARS], now)
@@ -948,6 +1030,14 @@ def parser() -> argparse.ArgumentParser:
     paper_mark = sub.add_parser("paper-mark", help="写入本地模拟账户的当日净值")
     paper_mark.add_argument("--name", default="default")
     paper_mark.add_argument("--as-of")
+    paper_auto_init = sub.add_parser("paper-auto-init", help="创建按候选快照自动调仓的本地模拟账户")
+    paper_auto_init.add_argument("--name", default="momentum-10k")
+    paper_auto_init.add_argument("--cash", type=float, default=10_000)
+    paper_auto_init.add_argument("--top-n", type=int, default=3)
+    paper_auto_init.add_argument("--rebalance-every", type=int, default=20)
+    paper_rebalance = sub.add_parser("paper-rebalance", help="按上一候选快照执行一次本地模拟调仓")
+    paper_rebalance.add_argument("--name", default="momentum-10k")
+    paper_rebalance.add_argument("--as-of", help="模拟成交日，默认最近完整覆盖日")
     check = sub.add_parser("check", help="自动检查策略是否仅可进入模拟观察；绝不输出实盘许可")
     check.add_argument("--symbols", required=True, help="逗号分隔的股票池")
     check.add_argument("--benchmark", default="000300")
@@ -1011,7 +1101,7 @@ def main() -> None:
         if args.command in ("update", "daily"):
             if date.fromisoformat(args.bootstrap_start) > date.fromisoformat(args.end):
                 raise ValueError("--bootstrap-start 不能晚于 --end")
-        {"init": run_init, "update": run_update, "list": run_list, "status": run_status, "audit": run_audit, "backtest": run_backtest, "rotation": run_rotation, "validate": run_validate, "compare": run_compare, "candidates": run_candidates, "snapshot-status": run_snapshot_status, "paper-init": run_paper_init, "paper-status": run_paper_status, "paper-mark": run_paper_mark, "check": run_check, "daily": run_daily, "notify": run_notify}[args.command](args)
+        {"init": run_init, "update": run_update, "list": run_list, "status": run_status, "audit": run_audit, "backtest": run_backtest, "rotation": run_rotation, "validate": run_validate, "compare": run_compare, "candidates": run_candidates, "snapshot-status": run_snapshot_status, "paper-init": run_paper_init, "paper-status": run_paper_status, "paper-mark": run_paper_mark, "paper-auto-init": run_paper_auto_init, "paper-rebalance": run_paper_rebalance, "check": run_check, "daily": run_daily, "notify": run_notify}[args.command](args)
     except Exception as error:
         LOG.error("%s", error)
         raise SystemExit(1) from error

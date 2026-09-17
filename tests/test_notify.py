@@ -42,6 +42,11 @@ def digest(**overrides):
 
 
 class NotifyTests(unittest.TestCase):
+    def test_card_explains_when_previous_pool_backtest_is_unavailable(self):
+        rendered = json.dumps(build_card(digest()), ensure_ascii=False)
+        self.assertIn("上一日候选池回测：暂不可用", rendered)
+        self.assertIn("尚无早于本次数据日的候选快照", rendered)
+
     def test_signature_uses_timestamp_newline_secret_as_key(self):
         secret, timestamp = "s3cret", 1758108912
         expected = base64.b64encode(

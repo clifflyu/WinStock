@@ -7,11 +7,12 @@ from tempfile import TemporaryDirectory
 from winstocker.audit import audit_database, scale_drift
 from winstocker.calendar import refresh_calendar, suspended_days, trading_days_between
 from winstocker.cli import save_default_candidate_snapshot, symbol_starts
-from winstocker.candidates import momentum_candidates
+from winstocker.candidates import Candidate, momentum_candidates
 from winstocker.evaluation import compare_buy_and_hold
 from winstocker.gate import evaluate_gate
-from winstocker.snapshots import save_snapshot, snapshot_status
-from winstocker.paper import account_status, create_account, mark_account
+from winstocker.snapshots import DEFAULT_STRATEGY_KEY, previous_snapshot, save_snapshot, snapshot_status
+from winstocker.paper import (account_status, create_account, enable_auto_strategy, mark_account,
+                              rebalance_account)
 from winstocker.robustness import walk_forward_robustness
 from winstocker.reporting import research_warnings, write_backtest_report, write_walk_forward_report
 from winstocker.backtest import Bar, dual_ma_backtest, limit_ratio, momentum_rotation_backtest, walk_forward_rotation
@@ -153,6 +154,17 @@ class BacktestTests(unittest.TestCase):
         self.assertEqual(save_snapshot(conn, "momentum-20", [candidate]), 1)
         self.assertEqual(snapshot_status(conn), (1, 1, "2024-01-02"))
 
+    def test_previous_snapshot_is_strictly_earlier_than_data_date(self):
+        conn = sqlite3.connect(":memory:")
+        self.addCleanup(conn.close)
+        earlier = Candidate("600000", "前日", "2024-01-02", 0.1, 30_000_000, 250)
+        current = Candidate("000001", "当日", "2024-01-03", 0.2, 40_000_000, 250)
+        save_snapshot(conn, DEFAULT_STRATEGY_KEY, [earlier])
+        save_snapshot(conn, DEFAULT_STRATEGY_KEY, [current])
+        as_of, symbols = previous_snapshot(conn, "2024-01-03")
+        self.assertEqual(as_of, "2024-01-02")
+        self.assertEqual(symbols, ("600000",))
+
     def test_default_snapshot_uses_complete_day_candidates(self):
         conn = sqlite3.connect(":memory:")
         self.addCleanup(conn.close)
@@ -173,6 +185,36 @@ class BacktestTests(unittest.TestCase):
         status = mark_account(conn, "test", "2024-01-02")
         self.assertEqual(status.total_value, 100_000)
         self.assertEqual(account_status(conn, "test", "2024-01-02").positions, 0)
+
+    def test_auto_paper_rebalance_uses_previous_snapshot_and_is_idempotent(self):
+        conn = sqlite3.connect(":memory:")
+        self.addCleanup(conn.close)
+        conn.executescript("""
+            CREATE TABLE daily_kline
+              (symbol TEXT, trade_date TEXT, open REAL, close REAL, amount REAL);
+            CREATE TABLE trading_calendar (trade_date TEXT PRIMARY KEY);
+            INSERT INTO trading_calendar VALUES ('2024-01-02'), ('2024-01-03');
+            INSERT INTO daily_kline VALUES
+              ('600000', '2024-01-02', 10, 10, 30000000),
+              ('600000', '2024-01-03', 10.1, 10.2, 30000000),
+              ('000001', '2024-01-02', 20, 20, 30000000),
+              ('000001', '2024-01-03', 20.1, 20.2, 30000000);
+        """)
+        save_snapshot(conn, DEFAULT_STRATEGY_KEY, [
+            Candidate("600000", "甲", "2024-01-02", 0.2, 30_000_000, 250),
+            Candidate("000001", "乙", "2024-01-02", 0.1, 30_000_000, 250),
+        ])
+        create_account(conn, "auto", 10_000)
+        enable_auto_strategy(conn, "auto", top_n=2, rebalance_every=20)
+        first = rebalance_account(conn, "auto", "2024-01-03")
+        self.assertTrue(first.executed)
+        self.assertEqual(first.buys, 2)
+        trades = conn.execute("SELECT COUNT(*) FROM paper_trades").fetchone()[0]
+        cash = first.status.cash
+        second = rebalance_account(conn, "auto", "2024-01-03")
+        self.assertFalse(second.executed)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM paper_trades").fetchone()[0], trades)
+        self.assertEqual(second.status.cash, cash)
 
     def test_dual_ma_counts_only_suspension_days_actually_held(self):
         # slow=2 时首个信号出现在索引 3，因此停牌要放在那之后才可能被持仓覆盖。

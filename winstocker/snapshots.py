@@ -7,6 +7,8 @@ from typing import Iterable
 from .candidates import Candidate
 
 
+DEFAULT_STRATEGY_KEY = "momentum-20-history-250-amount-2e+07-top-10"
+
 SNAPSHOT_SCHEMA = """
 CREATE TABLE IF NOT EXISTS candidate_snapshots (
     strategy_key TEXT NOT NULL,
@@ -47,3 +49,22 @@ def save_snapshot(conn: sqlite3.Connection, strategy_key: str, candidates: Itera
 def snapshot_status(conn: sqlite3.Connection) -> tuple[int, int, str | None]:
     conn.executescript(SNAPSHOT_SCHEMA)
     return conn.execute("SELECT COUNT(DISTINCT as_of), COUNT(*), MAX(as_of) FROM candidate_snapshots").fetchone()
+
+
+def previous_snapshot(conn: sqlite3.Connection, before: str,
+                      strategy_key: str = DEFAULT_STRATEGY_KEY) -> tuple[str | None, tuple[str, ...]]:
+    """读取 strictly earlier 的最近候选池，避免把当天刚生成的快照当成“上一日”。"""
+    conn.executescript(SNAPSHOT_SCHEMA)
+    row = conn.execute(
+        "SELECT MAX(as_of) FROM candidate_snapshots WHERE strategy_key = ? AND as_of < ?",
+        (strategy_key, before),
+    ).fetchone()
+    as_of = row[0] if row else None
+    if not as_of:
+        return None, ()
+    symbols = tuple(row[0] for row in conn.execute(
+        """SELECT symbol FROM candidate_snapshots
+           WHERE strategy_key = ? AND as_of = ? ORDER BY momentum DESC, symbol""",
+        (strategy_key, as_of),
+    ))
+    return as_of, symbols
