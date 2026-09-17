@@ -103,7 +103,7 @@ SELECT trade_date, close FROM daily_kline WHERE symbol = '600000' AND trade_date
 
 ## 服务器每日自动更新
 
-可使用 `deploy/` 中的 systemd 定时器，在每个工作日 16:40（Asia/Shanghai）自动执行数据更新、候选快照和审计。部署说明见 [deploy/README.md](deploy/README.md)。该服务只访问行情接口和本地 SQLite，不连接任何券商。
+可使用 `deploy/` 中的 systemd 定时器，每天 19:30（Asia/Shanghai）自动执行数据更新、候选快照和审计。部署说明见 [deploy/README.md](deploy/README.md)。该服务只访问行情接口和本地 SQLite，不连接任何券商。
 
 运行回测前先执行 `audit`。它会把**真实缺陷**与**正常形态**分开报告：无日线的股票大多只是尚未上市，落后的股票大多只是停牌，两者都不算数据问题；只有「抓取失败」「非停牌导致的落后」以及「前复权序列尺度异常」才会让审计不通过。`check` 的准入判定与 `audit` 使用同一组计数，两者不会再给出互相矛盾的结论。若审计不通过，先修复或排除相应标的；不要把缺失数据造成的回测结果当作策略优势。
 

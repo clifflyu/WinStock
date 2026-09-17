@@ -1,9 +1,9 @@
 [Unit]
-Description=Run WinStock after each weekday A-share close
+Description=Run WinStock daily at 19:30 Asia/Shanghai
 
 [Timer]
-# Explicit timezone means a server outside China still runs at 16:40 Beijing time.
-OnCalendar=Mon..Fri *-*-* 16:40:00 Asia/Shanghai
+# Explicit timezone means a server outside China still runs at 19:30 Beijing time.
+OnCalendar=*-*-* 19:30:00 Asia/Shanghai
 Persistent=true
 Unit=winstock-update.service
 
