@@ -55,3 +55,13 @@ def write_walk_forward_report(path: Path, parameters: dict[str, Any], result: An
     document = {"schema_version": 1, "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "strategy": "momentum_rotation_walk_forward", "parameters": parameters, "result": asdict(result), "warnings": warnings}
     path.write_text(json.dumps(document, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return path
+
+
+def write_comparison_report(path: Path, parameters: dict[str, Any], strategy_result: Any, comparison: Any) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    warnings = research_warnings(strategy_result)
+    if comparison.excess_return <= 0:
+        warnings.append("策略未跑赢基准买入持有，不应作为主动交易候选。")
+    document = {"schema_version": 1, "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "strategy": "momentum_rotation_comparison", "parameters": parameters, "strategy_result": asdict(strategy_result), "benchmark_comparison": asdict(comparison), "warnings": warnings}
+    path.write_text(json.dumps(document, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return path

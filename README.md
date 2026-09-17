@@ -36,6 +36,9 @@ python -m winstocker rotation --symbols 600000,000001,300750,600519 --output rep
 
 # 将前 70% 历史作为训练段，后 30% 作为未参与评估的验证段
 python -m winstocker validate --symbols 600000,000001,300750,600519 --output reports/validation.json
+
+# 与沪深 300 买入持有比较，检查主动策略是否创造超额收益
+python -m winstocker compare --symbols 600000,000001,300750,600519 --benchmark 000300
 ```
 
 数据库路径可用 `--db /path/to/file.db` 指定。首次使用执行 `init`；此后每个交易日收盘后执行 `update`。`update` 会重抓最新已存交易日以修订可能的源端更正，再补齐新交易日，而非重下全量历史。证券和日 K 均以主键 UPSERT，失败的证券会记录在 `download_failures` 表中，下一次更新会重试。
@@ -94,3 +97,5 @@ SELECT trade_date, close FROM daily_kline WHERE symbol = '600000' AND trade_date
 给 `backtest` 或 `rotation` 传入 `--output reports/name.json` 会保存机器可读的研究档案：策略参数、数据区间、交易成本、结果和风险提示。报告会明确标记成交次数不足、回撤超过 20%、亏损区间或跌停无法卖出的情况；它不会给任何策略标注“保证盈利”。
 
 `validate` 会按时间顺序切分训练段与样本外验证段，两段独立建仓、独立回测。验证段不是未来预测，但它没有参与同一次结果评估，能更早暴露只适合历史行情的策略。验证段为负、交易样本太少或明显弱于训练段时，不应进入模拟交易。
+
+`compare` 默认以沪深 300（000300）价格指数的同期买入持有收益为基准，并输出策略超额收益。指数价格口径不含基金申赎成本与股息再投资，故只用作基础市场比较；未跑赢基准的策略不应作为主动交易候选。

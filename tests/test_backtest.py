@@ -6,6 +6,7 @@ from tempfile import TemporaryDirectory
 
 from winstocker.audit import audit_database
 from winstocker.cli import incremental_start
+from winstocker.evaluation import compare_buy_and_hold
 from winstocker.reporting import research_warnings, write_backtest_report, write_walk_forward_report
 from winstocker.backtest import Bar, dual_ma_backtest, limit_ratio, momentum_rotation_backtest, walk_forward_rotation
 
@@ -84,6 +85,16 @@ class BacktestTests(unittest.TestCase):
             path = write_walk_forward_report(Path(directory) / "validation.json", {"lookback": 2}, result)
             document = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(document["result"]["split_day"], result.split_day)
+
+    def test_benchmark_comparison_calculates_excess_return(self):
+        benchmark = [Bar("2024-01-02", 105, 105), Bar("2024-01-01", 100, 100)]
+        comparison = compare_buy_and_hold("000300", benchmark, "2024-01-01", "2024-01-02", 0.12)
+        self.assertAlmostEqual(comparison.benchmark_return, 0.05)
+        self.assertAlmostEqual(comparison.excess_return, 0.07)
+
+    def test_benchmark_comparison_rejects_incomplete_period(self):
+        with self.assertRaises(ValueError):
+            compare_buy_and_hold("000300", [Bar("2024-01-10", 100, 100), Bar("2024-01-11", 101, 101)], "2024-01-01", "2024-02-01", 0.1)
 
 
 if __name__ == "__main__":

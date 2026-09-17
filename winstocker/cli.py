@@ -15,8 +15,9 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from .audit import audit_database
-from .backtest import dual_ma_backtest, load_bars, load_panel, momentum_rotation_backtest, walk_forward_rotation
-from .reporting import write_backtest_report, write_walk_forward_report
+from .backtest import Bar, dual_ma_backtest, load_bars, load_panel, momentum_rotation_backtest, walk_forward_rotation
+from .evaluation import compare_buy_and_hold
+from .reporting import write_backtest_report, write_comparison_report, write_walk_forward_report
 
 LOG = logging.getLogger("winstocker")
 # 清单取自东方财富的延时行情主机：push2 与 push2his 会对海外和机房 IP 直接断连。
@@ -503,6 +504,41 @@ def run_validate(args: argparse.Namespace) -> None:
         conn.close()
 
 
+def index_code(symbol: str) -> str:
+    """Tencent market prefixes for common mainland broad-market indexes."""
+    symbol = symbol.lower()
+    if symbol.startswith(("sh", "sz")):
+        return symbol
+    return f'{"sz" if symbol.startswith("399") else "sh"}{symbol}'
+
+
+def run_compare(args: argparse.Namespace) -> None:
+    symbols = tuple(item.strip() for item in args.symbols.split(",") if item.strip())
+    conn = connect(args.db)
+    try:
+        result = momentum_rotation_backtest(
+            load_panel(conn, symbols, args.start, args.end), args.top_n, args.lookback, args.rebalance_every,
+            args.cash, args.commission, args.min_commission, args.stamp_duty, args.slippage_bps,
+        )
+        raw = fetch_kline_bars(index_code(args.benchmark), result.start, result.end, "qfq")
+        bars = [Bar(day, float(row[1]), float(row[2])) for day, row in raw.items() if len(row) > 2]
+        comparison = compare_buy_and_hold(args.benchmark, bars, result.start, result.end, result.total_return)
+        print(
+            f"策略收益：{comparison.strategy_return:.2%}\n{args.benchmark} 买入持有：{comparison.benchmark_return:.2%}\n"
+            f"超额收益：{comparison.excess_return:.2%}\n"
+            f"结论：{'跑赢基准（仍须通过样本外验证）' if comparison.excess_return > 0 else '未跑赢基准，不作为主动交易候选'}"
+        )
+        if args.output:
+            path = write_comparison_report(args.output, {
+                "symbols": symbols, "benchmark": args.benchmark, "top_n": args.top_n, "lookback": args.lookback,
+                "rebalance_every": args.rebalance_every, "cash": args.cash, "commission": args.commission,
+                "min_commission": args.min_commission, "stamp_duty": args.stamp_duty, "slippage_bps": args.slippage_bps,
+            }, result, comparison)
+            print(f"研究报告：{path}")
+    finally:
+        conn.close()
+
+
 def parser() -> argparse.ArgumentParser:
     app = argparse.ArgumentParser(description="WinStock A 股清单与日 K 初始化工具")
     app.add_argument("--db", type=Path, default=DEFAULT_DB, help="SQLite 数据库路径（默认 data/winstock.db）")
@@ -560,6 +596,20 @@ def parser() -> argparse.ArgumentParser:
     validate.add_argument("--stamp-duty", type=float, default=0.0005)
     validate.add_argument("--slippage-bps", type=float, default=5)
     validate.add_argument("--output", type=Path, help="将训练/验证结果写入 JSON 报告")
+    compare = sub.add_parser("compare", help="将动量轮动与市场基准的买入持有收益比较")
+    compare.add_argument("--symbols", required=True, help="逗号分隔的股票池")
+    compare.add_argument("--benchmark", default="000300", help="基准指数，默认沪深 300（000300）")
+    compare.add_argument("--start", help="回测起始日，默认使用全量数据")
+    compare.add_argument("--end", help="回测结束日，默认使用全量数据")
+    compare.add_argument("--top-n", type=int, default=3)
+    compare.add_argument("--lookback", type=int, default=20)
+    compare.add_argument("--rebalance-every", type=int, default=20)
+    compare.add_argument("--cash", type=float, default=100_000)
+    compare.add_argument("--commission", type=float, default=0.0003)
+    compare.add_argument("--min-commission", type=float, default=5)
+    compare.add_argument("--stamp-duty", type=float, default=0.0005)
+    compare.add_argument("--slippage-bps", type=float, default=5)
+    compare.add_argument("--output", type=Path, help="将策略与基准比较写入 JSON 报告")
     return app
 
 
@@ -577,7 +627,7 @@ def main() -> None:
         if args.command == "update":
             if date.fromisoformat(args.bootstrap_start) > date.fromisoformat(args.end):
                 raise ValueError("--bootstrap-start 不能晚于 --end")
-        {"init": run_init, "update": run_update, "list": run_list, "status": run_status, "audit": run_audit, "backtest": run_backtest, "rotation": run_rotation, "validate": run_validate}[args.command](args)
+        {"init": run_init, "update": run_update, "list": run_list, "status": run_status, "audit": run_audit, "backtest": run_backtest, "rotation": run_rotation, "validate": run_validate, "compare": run_compare}[args.command](args)
     except Exception as error:
         LOG.error("%s", error)
         raise SystemExit(1) from error
