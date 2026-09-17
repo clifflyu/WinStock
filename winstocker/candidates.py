@@ -5,6 +5,23 @@ from dataclasses import dataclass
 import sqlite3
 
 from .audit import audit_database
+from .calendar import calendar_schema_present
+
+
+def _momentum_window(conn: sqlite3.Connection, as_of: str, lookback: int) -> list[str] | None:
+    """动量区间应覆盖的交易日（含作为基准的那一天）。
+
+    日历表缺失时返回 None，消费方据此跳过连续性检查而不是整体失败。
+    """
+    if not calendar_schema_present(conn):
+        return None
+    rows = conn.execute(
+        "SELECT trade_date FROM trading_calendar WHERE trade_date <= ? ORDER BY trade_date DESC LIMIT ?",
+        (as_of, lookback + 1),
+    ).fetchall()
+    if len(rows) < lookback + 1:
+        return None
+    return [row[0] for row in rows]
 
 
 @dataclass(frozen=True)
@@ -41,10 +58,17 @@ def momentum_candidates(
     grouped: dict[tuple[str, str], list[tuple[str, float, float | None]]] = {}
     for symbol, name, day, close, amount, _ in rows:
         grouped.setdefault((symbol, name), []).append((day, float(close), float(amount) if amount is not None else None))
+    window = _momentum_window(conn, as_of, lookback)
     result: list[Candidate] = []
     for (symbol, name), bars in grouped.items():
         if "ST" in name.upper() or len(bars) < min_history or bars[0][0] != as_of:
             continue
+        # 动量区间必须逐日连续。停牌会让 bars[lookback] 落到更早的日历日上，
+        # 使「20 日动量」实际跨越约 25 个交易日——README 一直声称排除这类股票。
+        if window is not None:
+            present = {day for day, _, _ in bars}
+            if any(day not in present for day in window):
+                continue
         recent = bars[:lookback]
         if any(amount is None for _, _, amount in recent):
             continue

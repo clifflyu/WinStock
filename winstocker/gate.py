@@ -12,8 +12,16 @@ class ResearchGate:
 
 def evaluate_gate(audit: object, validation: object, comparison: object, max_drawdown: float = -0.20, min_trades: int = 10, robustness: object | None = None) -> ResearchGate:
     reasons: list[str] = []
+    # 这里必须与 audit 的结论一致：此前只看 integrity/failures，导致 audit 打印
+    # 「需检查」的同时 check 仍可能放行。未上市与停牌都不算缺陷，故只看真实失败项。
     if audit.integrity != "ok" or audit.failures:
         reasons.append("数据完整性或下载任务异常。")
+    if audit.no_data_failed:
+        reasons.append(f"{audit.no_data_failed} 只证券抓取失败且完全没有日线。")
+    if audit.lagging_failed:
+        reasons.append(f"{audit.lagging_failed} 只证券数据落后且并非停牌所致。")
+    if audit.broken_change_rows:
+        reasons.append(f"前复权序列有 {audit.broken_change_rows} 行尺度异常，回测收益率不可信。")
     holdout = validation.validation
     if holdout.trades < min_trades:
         reasons.append(f"样本外仅 {holdout.trades} 笔成交，低于 {min_trades} 笔最低样本门槛。")

@@ -14,8 +14,9 @@ from typing import Any, Iterable
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from .audit import audit_database
+from .audit import audit_database, scale_drift
 from .backtest import Bar, dual_ma_backtest, load_bars, load_panel, momentum_rotation_backtest, walk_forward_rotation
+from .calendar import ensure_calendar, refresh_calendar, trading_days_between
 from .candidates import momentum_candidates
 from .evaluation import compare_buy_and_hold
 from .gate import evaluate_gate
@@ -135,6 +136,8 @@ def connect(db_path: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA synchronous=NORMAL")
     migrate_legacy(conn)
     conn.executescript(KLINE_SCHEMA)
+    # 日历与停牌表在升级后的第一次运行时惰性建立；此后开销仅为一次 COUNT。
+    ensure_calendar(conn)
     return conn
 
 
@@ -328,17 +331,30 @@ def run_init(args: argparse.Namespace) -> None:
                 conn.executemany("DELETE FROM download_failures WHERE symbol = ?", [(item["symbol"],) for item in group if item["symbol"] not in {e[0] for e in errors}])
                 conn.executemany("INSERT INTO download_failures(symbol, error, failed_at) VALUES (?, ?, ?) ON CONFLICT(symbol) DO UPDATE SET error=excluded.error, failed_at=excluded.failed_at", errors)
             LOG.info("批次 %d：完成 %d/%d（成功 %d，失败 %d，写入 %d 条日 K）", number, min(number * args.batch_size, len(securities)), len(securities), successful, failed, len(rows_to_save))
+        days, suspended = refresh_calendar(conn)
+        LOG.info("已重建交易日历：%d 个交易日，%d 条停牌记录。", days, suspended)
         LOG.info("初始化结束：成功 %d，失败 %d。运行 `python -m winstocker status` 查看详情。", successful, failed)
     finally:
         conn.close()
 
 
-def incremental_start(conn: sqlite3.Connection, end: str, bootstrap_start: str) -> str:
-    """Re-fetch the latest stored day so corrections are UPSERTed, then append new days."""
-    latest = conn.execute("SELECT MAX(trade_date) FROM kline").fetchone()[0]
-    if not latest:
-        return bootstrap_start
-    return min(latest, end)
+def symbol_starts(conn: sqlite3.Connection, end: str, bootstrap_start: str, repair: set[str]) -> dict[str, str]:
+    """每只股票各自的抓取起点。
+
+    默认从该股自己的最后一个已存交易日开始，而不是全库 MAX：用全库 MAX 时，一只中途
+    漏抓或停牌的股票永远补不回它自己的缺口。
+
+    对检测出前复权尺度漂移的股票，起点改用它自己的首个交易日以重抓全部历史——腾讯的
+    前复权按「减去累计现金分红」构造，一次除权会让整条历史换尺度，只重写最新几天等于
+    没修（这正是 600009 那类假跳变的成因）。
+    """
+    starts: dict[str, str] = {}
+    for symbol, first_day, last_day in conn.execute(
+        """SELECT s.symbol, MIN(k.trade_date), MAX(k.trade_date)
+           FROM securities s JOIN kline k ON k.symbol_id = s.id GROUP BY s.id"""
+    ):
+        starts[symbol] = first_day if symbol in repair else min(last_day, end)
+    return starts
 
 
 def save_default_candidate_snapshot(conn: sqlite3.Connection) -> int:
@@ -354,17 +370,24 @@ def run_update(args: argparse.Namespace) -> None:
         if not securities:
             raise RuntimeError("A 股清单为空，终止更新。")
         save_securities(conn, securities)
-        start = incremental_start(conn, args.end, args.bootstrap_start)
-        if date.fromisoformat(start) > date.fromisoformat(args.end):
-            raise ValueError("数据库最新日期晚于 --end；请指定更晚的 --end")
+        latest = conn.execute("SELECT MAX(trade_date) FROM kline").fetchone()[0]
+        if latest and latest > args.end:
+            raise ValueError(f"数据库已存到 {latest}，晚于 --end {args.end}；请指定更晚的 --end")
+        drift = scale_drift(conn)
+        repair = {symbol for symbol, _ in drift}
+        if repair:
+            LOG.warning("检测到 %d 只股票的前复权序列存在尺度漂移（%d 处边界），将从各自首个交易日重抓全史修复：%s",
+                        len(repair), len(drift), "、".join(sorted(repair)[:10]) + ("…" if len(repair) > 10 else ""))
+        starts = symbol_starts(conn, args.end, args.bootstrap_start, repair)
         ids = security_ids(conn)
-        LOG.info("增量更新 %s 至 %s，共 %d 只 A 股。", start, args.end, len(securities))
+        LOG.info("增量更新至 %s，共 %d 只 A 股（其中 %d 只按各自末日增量，%d 只全史修复）。",
+                 args.end, len(securities), len(securities) - len(repair), len(repair))
         successful, failed = 0, 0
         for number, group in enumerate(batches(securities, args.batch_size), start=1):
             rows_to_save: list[tuple[Any, ...]] = []
             errors: list[tuple[str, str, str]] = []
             with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
-                futures = {pool.submit(fetch_kline, item, start, args.end): item for item in group}
+                futures = {pool.submit(fetch_kline, item, starts.get(item["symbol"], args.bootstrap_start), args.end): item for item in group}
                 for future in concurrent.futures.as_completed(futures):
                     security = futures[future]
                     try:
@@ -391,6 +414,8 @@ def run_update(args: argparse.Namespace) -> None:
             LOG.info("已自动固化 %d 只候选股的历史快照。", save_default_candidate_snapshot(conn))
         elif failed:
             LOG.warning("本次有下载失败，跳过候选快照，避免固化不完整数据。")
+        days, suspended = refresh_calendar(conn)
+        LOG.info("已重建交易日历：%d 个交易日，%d 条停牌记录。", days, suspended)
         LOG.info("增量更新结束：成功 %d，失败 %d。请运行 `python -m winstocker audit`。", successful, failed)
     finally:
         conn.close()
@@ -422,13 +447,23 @@ def run_audit(args: argparse.Namespace) -> None:
     try:
         report = audit_database(conn, args.max_lag_days)
         verdict = "通过" if report.ok else "需检查（不要直接相信回测结果）"
+        unlisted = report.no_data_symbols - report.no_data_failed
+        suspended_lag = report.lagging_symbols - report.lagging_failed
+        if report.broken_change_rows:
+            consistency = (f"异常：{report.broken_change_rows} 行的涨跌额与相邻收盘价不符，"
+                           f"疑似前复权尺度漂移（重跑完整 init 或 update 可修复）")
+        else:
+            consistency = "通过（无尺度漂移）"
         print(
             f"数据审计：{verdict}\n数据库完整性：{report.integrity}\n"
             f"活跃证券：{report.active_securities}\n有日线证券：{report.symbols_with_bars}\n"
             f"日线总数：{report.rows}\n完整覆盖截至：{report.latest_day or '-'}（{report.latest_day_symbols} 只）\n"
             f"最新观测日：{report.newest_observed_day or '-'}（{report.newest_observed_symbols} 只）\n"
-            f"无日线证券：{report.no_data_symbols}\n"
-            f"落后最新日超过 {args.max_lag_days} 天：{report.lagging_symbols} 只\n"
+            f"无日线证券：{report.no_data_symbols}（抓取失败 {report.no_data_failed}，未上市 {unlisted}）\n"
+            f"落后最新日超过 {args.max_lag_days} 天：{report.lagging_symbols} 只"
+            f"（停牌 {suspended_lag}，真实落后 {report.lagging_failed}）\n"
+            f"区间内停牌股票：{report.suspended_symbols} 只\n"
+            f"前复权序列自洽性：{consistency}\n"
             f"下载失败待重试：{report.failures}"
         )
     finally:
@@ -442,6 +477,7 @@ def run_backtest(args: argparse.Namespace) -> None:
         result = dual_ma_backtest(
             bars, args.symbol, args.fast, args.slow, args.cash, args.commission,
             args.min_commission, args.stamp_duty, args.slippage_bps,
+            trading_days=trading_days_between(conn, args.start, args.end),
         )
         annualized = "-" if result.annualized_return is None else f"{result.annualized_return:.2%}"
         print(
@@ -450,7 +486,8 @@ def run_backtest(args: argparse.Namespace) -> None:
             f"初始资金：{result.initial_cash:,.2f}\n最终权益：{result.final_value:,.2f}\n"
             f"总收益：{result.total_return:.2%}\n年化收益：{annualized}\n"
             f"最大回撤：{result.max_drawdown:.2%}\n成交笔数：{result.trades}\n"
-            f"涨停未买入：{result.blocked_buys}\n跌停未卖出：{result.blocked_sells}"
+            f"涨停未买入：{result.blocked_buys}\n跌停未卖出：{result.blocked_sells}\n"
+            f"区间内停牌（无法交易）：{result.suspension_days} 天"
         )
         if args.output:
             path = write_backtest_report(args.output, "dual_ma", {
@@ -479,7 +516,8 @@ def run_rotation(args: argparse.Namespace) -> None:
             f"初始资金：{result.initial_cash:,.2f}\n最终权益：{result.final_value:,.2f}\n"
             f"总收益：{result.total_return:.2%}\n年化收益：{annualized}\n最大回撤：{result.max_drawdown:.2%}\n"
             f"调仓次数：{result.rebalances}\n成交笔数：{result.trades}\n"
-            f"涨停未买入：{result.blocked_buys}\n跌停未卖出：{result.blocked_sells}"
+            f"涨停未买入：{result.blocked_buys}\n跌停未卖出：{result.blocked_sells}\n"
+            f"停牌无法卖出：{result.suspension_blocked_sells} 次；持仓处于停牌中：{result.suspension_days} 天"
         )
         if args.output:
             path = write_backtest_report(args.output, "momentum_rotation", {
@@ -506,7 +544,9 @@ def run_validate(args: argparse.Namespace) -> None:
         )
         def summary(label: str, item: Any) -> str:
             annualized = "-" if item.annualized_return is None else f"{item.annualized_return:.2%}"
-            return f"{label}（{item.start} 至 {item.end}）：收益 {item.total_return:.2%}，年化 {annualized}，回撤 {item.max_drawdown:.2%}，成交 {item.trades} 笔"
+            return (f"{label}（{item.start} 至 {item.end}）：收益 {item.total_return:.2%}，年化 {annualized}，"
+                    f"回撤 {item.max_drawdown:.2%}，成交 {item.trades} 笔，"
+                    f"持仓停牌 {item.suspension_days} 天")
         print(f"样本外验证切分日：{result.split_day}\n{summary('训练段', result.train)}\n{summary('验证段', result.validation)}")
         if args.output:
             path = write_walk_forward_report(args.output, {

@@ -2,7 +2,9 @@
 
 This package installs a local `systemd` timer. It never connects to a broker and never creates real orders.
 
-The timer runs at 16:40 Asia/Shanghai from Monday through Friday. A holiday run is harmless: the updater re-fetches the last stored trading day, records any source correction, and the next trading day is picked up normally. `Persistent=true` asks systemd to run a missed calendar job after the server returns online.
+The timer runs at 16:40 Asia/Shanghai from Monday through Friday. A holiday run is harmless: the updater re-fetches each stock's own last stored trading day, records any source correction, and the next trading day is picked up normally. Note that the start date is per symbol, not a single global date, so a stock that missed days earlier is refilled rather than skipped. `Persistent=true` asks systemd to run a missed calendar job after the server returns online.
+
+`update` also self-checks for forward-adjustment scale drift before fetching: Tencent builds the adjusted series by subtracting cumulative cash dividends, so one ex-dividend event rescales a stock's entire history, and an incremental write would leave a phantom jump at the seam. Any stock that fails the check is refetched from its own first trading day. This is automatic and shows up in the journal as a `检测到 N 只股票的前复权序列存在尺度漂移` warning.
 
 ## One-time deployment
 

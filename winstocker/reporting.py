@@ -10,7 +10,8 @@ from typing import Any
 
 DISCLAIMERS = [
     "研究回测不是收益承诺，也不能直接用于实盘下单。",
-    "当前数据不含历史 ST 标记、完整停复牌状态、现金分红和实时盘口成交。",
+    "停牌状态由日线缺口推导，只能识别整天停牌，且依赖该股最近一次抓取成功；"
+    "数据仍不含历史 ST 标记、现金分红和实时盘口成交。",
     "股票池须按历史时点固化；用当前全市场名单回测会产生幸存者偏差。",
 ]
 
@@ -26,6 +27,15 @@ def research_warnings(result: Any) -> list[str]:
         warnings.append("区间总收益非正，不应进入模拟交易阶段。")
     if result.blocked_sells:
         warnings.append(f"发生 {result.blocked_sells} 次跌停无法卖出；实盘流动性风险可能更高。")
+    if getattr(result, "suspension_days", 0):
+        warnings.append(
+            f"持仓有 {result.suspension_days} 天处于停牌：这段净值按停牌前收盘价挂着，"
+            f"曲线会走平，看起来像低波动，实际是无法卖出。回撤与波动率因此被低估。"
+        )
+    if getattr(result, "suspension_blocked_sells", 0):
+        warnings.append(
+            f"有 {result.suspension_blocked_sells} 次调仓因停牌无法卖出，已推迟到复牌当日成交。"
+        )
     return warnings
 
 
